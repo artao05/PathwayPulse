@@ -27,6 +27,32 @@ _BIORXIV_BASE = "https://api.biorxiv.org/details/{server}/{start}/{end}/{cursor}
 _CHEMRXIV_BASE = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
 _MAX_RECORDS_PER_SERVER = 300
 
+_PREPRINT_URL_BASES = {
+    "biorxiv": "https://www.biorxiv.org",
+    "medrxiv": "https://www.medrxiv.org",
+}
+
+
+def _preprint_url(server: str, doi: str) -> str:
+    """Build canonical preprint URL from server name and DOI."""
+    base = _PREPRINT_URL_BASES.get(server, "https://www.biorxiv.org")
+    return f"{base}/content/{doi}v1" if doi else ""
+
+
+def _source_label(record: dict) -> str:
+    """Return a human-readable source label for display in the UI."""
+    src = record.get("source", "")
+    if src == "reddit":
+        return f"r/{record.get('subreddit', 'reddit')}"
+    if src == "twitter":
+        handle = record.get("handle", "")
+        return f"@{handle}" if handle else "X/Twitter"
+    if src in ("biorxiv", "medrxiv"):
+        return src.replace("biorxiv", "bioRxiv").replace("medrxiv", "medRxiv")
+    if src == "chemrxiv":
+        return "ChemRxiv"
+    return src
+
 
 # ── 1. Reddit RSS Feed (no auth, no PRAW, no Bright Data) ────────────────────
 # Reddit's Atom RSS feeds are publicly accessible for all public subreddits
@@ -92,6 +118,7 @@ def extract_reddit_alpha(subreddit: str = "biotech", limit: int = 50) -> list[di
             results.append({
                 "source": "reddit",
                 "subreddit": subreddit,
+                "source_label": f"r/{subreddit}",
                 "title": title,
                 "body": body,
                 "url": post_url,
@@ -151,9 +178,12 @@ def fetch_preprints(server: str = "biorxiv", days_back: int = 3) -> list[dict]:
             break
 
         for item in collection:
+            doi = item.get("doi", "")
             records.append({
                 "source": server,
-                "doi": item.get("doi", ""),
+                "doi": doi,
+                "url": _preprint_url(server, doi),
+                "source_label": server.replace("biorxiv", "bioRxiv").replace("medrxiv", "medRxiv"),
                 "title": item.get("title", ""),
                 "abstract": item.get("abstract", ""),
                 "category": item.get("category", ""),
@@ -280,12 +310,17 @@ def fetch_x_kol_grok(
             text = str(post.get("text", "")).strip()
             if not text:
                 continue
+            handle = str(post.get("handle", ""))
+            post_url = str(post.get("url", ""))
+            # Fall back to profile URL if Grok returned no post-level link
+            display_url = post_url or (f"https://x.com/{handle}" if handle else "")
             results.append({
                 "source": "twitter",
-                "handle": str(post.get("handle", "")),
+                "handle": handle,
+                "source_label": f"@{handle}" if handle else "X/Twitter",
                 "title": text[:80],
                 "body": text,
-                "url": str(post.get("url", "")),
+                "url": display_url,
             })
 
         log.info("Grok x_search: %d relevant posts from %d handles", len(results), len(handles))
@@ -347,9 +382,12 @@ def fetch_chemrxiv(days_back: int = 7) -> list[dict]:
             if not categories.intersection(target_categories):
                 continue
 
+            doi = item.get("doi", "")
             records.append({
                 "source": "chemrxiv",
-                "doi": item.get("doi", ""),
+                "doi": doi,
+                "url": f"https://doi.org/{doi}" if doi else "",
+                "source_label": "ChemRxiv",
                 "title": item.get("title", ""),
                 "abstract": item.get("abstract", ""),
                 "category": ", ".join(categories),

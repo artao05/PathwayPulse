@@ -65,11 +65,12 @@ def cached_ingest(
     days_back: int,
     include_chemrxiv: bool,
     kol_handles: tuple,          # tuple (not list) so @st.cache_data can hash it
+    reddit_subs: tuple,          # tuple for hashability
 ) -> list[dict]:
     return asyncio.run(
         ingest_all(
             pathway_hint=pathway,
-            reddit_subreddits=["biotech", "investing", "stocks"],
+            reddit_subreddits=list(reddit_subs),
             twitter_handles=list(kol_handles),
             days_back=days_back,
             include_chemrxiv=include_chemrxiv,
@@ -83,9 +84,10 @@ def cached_pipeline(
     days_back: int,
     include_chemrxiv: bool,
     kol_handles: tuple,
+    reddit_subs: tuple,
     model: str,
 ) -> tuple[list[dict], str]:
-    records = cached_ingest(pathway, days_back, include_chemrxiv, kol_handles)
+    records = cached_ingest(pathway, days_back, include_chemrxiv, kol_handles, reddit_subs)
     events, report = asyncio.run(
         run_pipeline(records, pathway, executioner_model=model)
     )
@@ -197,12 +199,36 @@ with st.sidebar:
     days_back = st.slider("Days of preprint history", min_value=1, max_value=14, value=3)
     include_chemrxiv = st.checkbox("Include ChemRxiv (preclinical)", value=False)
 
+    st.markdown("**Reddit Subreddits**")
+
+    # Load default subreddits from reddit_subreddits.json if present
+    import json as _json, pathlib as _pathlib
+    _default_subs: list[str] = ["biotech", "investing", "stocks"]
+    try:
+        _subs_path = _pathlib.Path(__file__).parent / "reddit_subreddits.json"
+        if _subs_path.exists():
+            _default_subs = _json.loads(_subs_path.read_text()).get("subreddits", _default_subs)
+    except Exception:
+        pass
+
+    subs_input = st.text_area(
+        "One subreddit per line or comma-separated",
+        value="\n".join(_default_subs),
+        placeholder="biotech\ninvesting\nstocks",
+        height=90,
+        help="Strip the r/ prefix — just the bare name. Monitored via Reddit RSS feed.",
+    )
+    reddit_subs: tuple = tuple(
+        s.strip().lstrip("r/").lstrip("/")
+        for s in subs_input.replace(",", "\n").splitlines()
+        if s.strip()
+    )
+
     st.markdown("**X / Twitter KOL Handles** (optional)")
 
     # Load default handles from kol_handles.json if present
     _default_handles: list[str] = []
     try:
-        import json as _json, pathlib as _pathlib
         _kol_path = _pathlib.Path(__file__).parent / "kol_handles.json"
         if _kol_path.exists():
             _default_handles = _json.loads(_kol_path.read_text()).get("handles", [])
@@ -275,14 +301,17 @@ if run_btn and pathway_input.strip():
         progress = st.progress(0, text="Ingesting data sources...")
 
         try:
-            ingest_label = "Scraping bioRxiv, medRxiv, Reddit"
+            sub_names = ", ".join(f"r/{s}" for s in reddit_subs[:3])
+            if len(reddit_subs) > 3:
+                sub_names += f" +{len(reddit_subs) - 3} more"
+            ingest_label = f"Scraping bioRxiv, medRxiv, Reddit ({sub_names})"
             if kol_handles and os.getenv("XAI_API_KEY"):
                 ingest_label += f", X/Twitter KOLs ({len(kol_handles)} handles)"
             ingest_label += "..."
             progress.progress(20, text=ingest_label)
 
             event_dicts, report = cached_pipeline(
-                pathway, days_back, include_chemrxiv, kol_handles, model_choice
+                pathway, days_back, include_chemrxiv, kol_handles, reddit_subs, model_choice
             )
             progress.progress(80, text="Building Arbitrage Matrix...")
 
@@ -293,7 +322,8 @@ if run_btn and pathway_input.strip():
                 "pathway": pathway,
                 "events": events,
                 "report": report,
-                "record_count": len(cached_ingest(pathway, days_back, include_chemrxiv, kol_handles)),
+                "record_count": len(cached_ingest(pathway, days_back, include_chemrxiv, kol_handles, reddit_subs)),
+                "records": cached_ingest(pathway, days_back, include_chemrxiv, kol_handles, reddit_subs),
             }
             st.session_state["flow_state"] = _build_flow_state(pathway, events)
             progress.progress(100, text="Done.")
@@ -311,6 +341,7 @@ if "pipeline_results" in st.session_state:
     events: list[CrossPollinationEvent] = results["events"]
     report: str = results["report"]
     record_count: int = results["record_count"]
+    raw_records: list[dict] = results.get("records", [])
 
     # Metrics row
     col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -372,9 +403,48 @@ if "pipeline_results" in st.session_state:
                 )
                 st.markdown(f"- Pathway: `{ev.baseline_pathway}`")
                 st.markdown(f"- Original indication: {ev.original_indication}")
-                st.markdown(f"- Evidence: _{ev.source_evidence[:200]}_")
+                # Source link — prefer title + URL, fall back gracefully
+                display_label = ev.source_title or ev.source_label or ev.source_type or "source"
+                if ev.source_url:
+                    st.markdown(f"- Source: [{display_label}]({ev.source_url})")
+                else:
+                    badge = ev.source_label or ev.source_type or "unknown"
+                    st.markdown(f"- Source: `{badge}`")
+                st.markdown(f"- Evidence: _{ev.source_evidence[:250]}_")
                 if i < len(events) - 1:
                     st.markdown("---")
+
+    # Ingested Sources expander — all raw records with links grouped by source type
+    if raw_records:
+        from collections import defaultdict
+        grouped: dict = defaultdict(list)
+        for rec in raw_records:
+            grouped[rec.get("source", "unknown")].append(rec)
+
+        source_order = ["biorxiv", "medrxiv", "chemrxiv", "reddit", "twitter"]
+        ordered_keys = [k for k in source_order if k in grouped] + [
+            k for k in grouped if k not in source_order
+        ]
+
+        with st.expander(f"🗂 Ingested Sources ({len(raw_records)} records)", expanded=False):
+            for src_key in ordered_keys:
+                recs = grouped[src_key]
+                label_map = {
+                    "biorxiv": "bioRxiv", "medrxiv": "medRxiv",
+                    "chemrxiv": "ChemRxiv", "reddit": "Reddit", "twitter": "X / Twitter",
+                }
+                src_display = label_map.get(src_key, src_key.title())
+                st.markdown(f"**{src_display}** — {len(recs)} records")
+                for rec in recs[:20]:
+                    title = rec.get("title") or rec.get("body", "")[:60]
+                    url = rec.get("url", "")
+                    label = rec.get("source_label", src_display)
+                    if url:
+                        st.markdown(f"  - [{title[:80]}]({url})")
+                    else:
+                        st.markdown(f"  - {title[:80]}")
+                if len(recs) > 20:
+                    st.caption(f"  … and {len(recs) - 20} more")
 
 else:
     # Landing state

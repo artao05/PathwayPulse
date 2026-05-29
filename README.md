@@ -36,12 +36,14 @@ The Arbitrage Matrix node graph populates with child nodes for each novel indica
 
 ```
 PathwayPulse/
-├── app.py                 # Streamlit dashboard (node graph + report)
-├── ai_orchestrator.py     # Dual-model AI pipeline (Synthesizer + Executioner)
-├── swarm_ingestion.py     # Four data ingestion agents
-├── test_connections.py    # API smoke-tests — run this first
-├── requirements.txt       # Python dependencies
-├── .env.template          # Copy to .env and fill in your API keys
+├── app.py                   # Streamlit dashboard (node graph + report)
+├── ai_orchestrator.py       # Dual-model AI pipeline (Synthesizer + Executioner)
+├── swarm_ingestion.py       # Four data ingestion agents
+├── test_connections.py      # API smoke-tests — run this first
+├── requirements.txt         # Python dependencies
+├── .env.template            # Copy to .env and fill in your API keys
+├── kol_handles.json         # Default X/Twitter KOL handles (override in sidebar)
+├── reddit_subreddits.json   # Default subreddits to monitor (override in sidebar)
 └── .gitignore
 ```
 
@@ -111,6 +113,7 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 | **Biological Pathway** | The pathway to track. Try `IL-6 signaling`, `GLP-1 receptor`, `JAK-STAT`, `mTOR`, `PD-1/PD-L1`, `mRNA delivery`. |
 | **Days of preprint history** | How far back to pull bioRxiv/medRxiv records. 3–7 days is a good default; use 14 for broad coverage. |
 | **Include ChemRxiv** | Adds preclinical pharmacology papers. Slower but adds signal depth. |
+| **Reddit Subreddits** | Which subreddits to monitor via RSS (one per line or comma-separated, no `r/` prefix needed). Pre-populated from `reddit_subreddits.json`. Override at runtime without editing any file. |
 | **X / Twitter KOL Handles** | Enter any number of public X handles (one per line or comma-separated, `@` optional). Grok searches their recent posts for pathway signals. Requires `XAI_API_KEY` in `.env`. Pre-populated from `kol_handles.json`. |
 | **Report model** | `gpt-4o` for speed; `o1` for deeper scientific reasoning. |
 | **Run Analysis** | Triggers the full pipeline. First run takes 2–4 minutes; subsequent runs load from a 1-hour cache instantly. |
@@ -123,6 +126,8 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 - **Crimson animated edges** — high-confidence signals (≥50% confidence score)
 - **Gray edges** — weak or speculative signals (<50%)
 - **Intelligence Report** — Bear / Bull / Neutral verdict with immunological soundness evaluation, ranked signal quality, risk factors, and a company/trial watch list
+- **📋 Raw Signal Data** — expandable panel showing every detected event with a clickable link back to the original paper, Reddit post, or X/Twitter profile
+- **🗂 Ingested Sources** — expandable panel listing all raw records pulled during the run, grouped by source type, each with a direct link to the source material
 
 ---
 

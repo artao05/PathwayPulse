@@ -1,0 +1,10 @@
+{
+  "_comment": "Default subreddits monitored via RSS. Edit freely or override in the sidebar at runtime. Strip the r/ prefix — just bare names.",
+  "subreddits": [
+    "biotech",
+    "investing",
+    "stocks",
+    "medicine",
+    "labrats"
+  ]
+}
