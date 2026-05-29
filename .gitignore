@@ -1,0 +1,25 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# runtime artifacts
+errors.log
+*.log
+
+# os
+.DS_Store
+Thumbs.db
+
+# editor
+.cursor/
+.vscode/
