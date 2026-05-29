@@ -3,7 +3,6 @@ pydantic>=2.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 tenacity>=8.2.3
-tweepy>=4.14.0
 playwright>=1.44.0
 streamlit>=1.35.0
 streamlit-flow-component>=0.5.0

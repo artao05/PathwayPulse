@@ -152,32 +152,55 @@ def test_preprint_apis() -> bool:
     return all_ok
 
 
-# ── 5. Twitter (optional) ─────────────────────────────────────────────────────
+# ── 5. Grok x_search / KOL Twitter ingestion (optional) ──────────────────────
 
-def test_twitter() -> bool:
-    print("\n[5/5] Twitter API (optional) ...")
-    token = os.getenv("TWITTER_BEARER_TOKEN")
-    if not token:
-        print(f"  {SKIP}  TWITTER_BEARER_TOKEN not set — Twitter agent will return [] (free tier is write-only)")
+def test_grok_xsearch() -> bool:
+    print("\n[5/5] Grok xAI x_search — KOL Twitter ingestion (optional) ...")
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        print(f"  {SKIP}  XAI_API_KEY not set — KOL Twitter ingestion disabled (add key to .env to enable)")
         return True
     try:
-        import tweepy
-        client = tweepy.Client(bearer_token=token)
-        user = client.get_user(username="nature")
-        if user.data:
-            print(f"  {PASS}  Twitter API reachable — user @nature id={user.data.id}")
+        from datetime import date, timedelta
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+        response = client.responses.create(
+            model="grok-3-latest",
+            input=[{"role": "user", "content": "Return one recent public post from this account as a JSON object with keys: handle, text, url. No markdown."}],
+            tools=[{
+                "type": "x_search",
+                "allowed_x_handles": ["BioPharmaDive"],
+                "from_date": yesterday,
+            }],
+        )
+
+        raw = ""
+        for item in response.output:
+            if hasattr(item, "content"):
+                for block in item.content:
+                    if hasattr(block, "text"):
+                        raw += block.text
+
+        if raw.strip():
+            print(f"  {PASS}  Grok x_search reachable. Response snippet: {raw.strip()[:120]}")
             return True
-        print(f"  {WARN}  Twitter responded but returned no data")
+
+        print(f"  {WARN}  Grok responded but returned no text content — x_search may have found no posts")
         return True
+
     except Exception as e:
         msg = str(e)
-        if "403" in msg or "Forbidden" in msg:
-            print(f"  {WARN}  Twitter free tier is read-restricted — agent will return [] (this is expected without Basic tier)")
-        elif "401" in msg or "Unauthorized" in msg:
-            print(f"  {FAIL}  TWITTER_BEARER_TOKEN is invalid — check your developer portal")
+        if "401" in msg or "Unauthorized" in msg:
+            print(f"  {FAIL}  XAI_API_KEY is invalid — check your key at console.x.ai")
+            return False
+        elif "403" in msg or "Forbidden" in msg:
+            print(f"  {FAIL}  Access denied — verify your xAI account has API access enabled")
             return False
         else:
-            print(f"  {WARN}  {type(e).__name__}: {e} — Twitter agent will fall back to []")
+            print(f"  {WARN}  {type(e).__name__}: {e} — KOL agent will return [] at runtime")
     return True
 
 
@@ -193,7 +216,7 @@ async def main():
     results["brightdata"] = await test_brightdata()
     results["reddit_scrape"] = test_reddit_scrape()
     results["preprints"] = test_preprint_apis()
-    results["twitter"] = test_twitter()
+    results["twitter"] = test_grok_xsearch()
 
     print("\n" + "=" * 60)
     print("  Summary")

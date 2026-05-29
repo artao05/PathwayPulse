@@ -1,0 +1,15 @@
+{
+  "_comment": "Curated list of public X/Twitter handles for KOL biotech signal ingestion. Edit freely — add or remove handles, max 20. The sidebar text area overrides this list at runtime.",
+  "handles": [
+    "EricTopol",
+    "BioPharmaDive",
+    "AdamFeuerstein",
+    "statnews",
+    "NatureMedicine",
+    "JLin_Immunology",
+    "oncobiologics",
+    "FDAspokesperson",
+    "broadinstitute",
+    "satijalab"
+  ]
+}

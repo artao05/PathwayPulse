@@ -82,7 +82,7 @@ Open `.env` and fill in your values:
 | `OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | `AIMLAPI_KEY` | [aimlapi.com](https://aimlapi.com) → API Keys |
 | `BRIGHTDATA_BROWSER_AUTH` | Bright Data dashboard → Scraping Browser zone → Access Parameters → `username:password` |
-| `TWITTER_BEARER_TOKEN` | Optional. Leave blank — free tier is write-only. |
+| `XAI_API_KEY` | [console.x.ai](https://console.x.ai) → API Keys — enables KOL Twitter/X ingestion via Grok |
 
 ### 4. Validate connections
 
@@ -111,6 +111,7 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 | **Biological Pathway** | The pathway to track. Try `IL-6 signaling`, `GLP-1 receptor`, `JAK-STAT`, `mTOR`, `PD-1/PD-L1`, `mRNA delivery`. |
 | **Days of preprint history** | How far back to pull bioRxiv/medRxiv records. 3–7 days is a good default; use 14 for broad coverage. |
 | **Include ChemRxiv** | Adds preclinical pharmacology papers. Slower but adds signal depth. |
+| **X / Twitter KOL Handles** | Enter any number of public X handles (one per line or comma-separated, `@` optional). Grok searches their recent posts for pathway signals. Requires `XAI_API_KEY` in `.env`. Pre-populated from `kol_handles.json`. |
 | **Report model** | `gpt-4o` for speed; `o1` for deeper scientific reasoning. |
 | **Run Analysis** | Triggers the full pipeline. First run takes 2–4 minutes; subsequent runs load from a 1-hour cache instantly. |
 | **Clear Cache** | Forces a fresh data pull and re-analysis. |
@@ -132,11 +133,13 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 | bioRxiv | REST API (`api.biorxiv.org`) | Free, no auth | Zero-authentication, paginated JSON |
 | medRxiv | REST API (`api.biorxiv.org`) | Free, no auth | Same API as bioRxiv, `server=medrxiv` |
 | Reddit | Atom RSS feed | Free, no auth | `reddit.com/r/{sub}/new.rss` — no OAuth required |
-| ChemRxiv | REST API (`chemrxiv.org`) | Free, no auth | Pharmacology/biochemistry filter applied |
-| Twitter/X | Optional | Free tier = write-only | Slot reserved; returns `[]` unless Bearer Token set |
+| X / Twitter | Grok `x_search` tool (xAI API) | ~$0.005/run | Requires `XAI_API_KEY`; enter handles in sidebar; max 20 |
+| ChemRxiv | REST API (`chemrxiv.org`) | Free, no auth | Pharmacology/biochemistry filter; enable via sidebar checkbox |
 | Bright Data | Scraping Browser (WebSocket) | $250 budget | Used for web targets requiring anti-bot evasion |
 
 > **Note on Reddit:** Reddit's JSON API and their Scraping Browser are both blocked (API requires OAuth; Bright Data respects Reddit's robots.txt). The RSS feed is the reliable zero-friction path and is explicitly permitted.
+
+> **Note on X/Twitter:** The free Twitter API is write-only. Bright Data's Scraping Browser cannot access X due to robots.txt compliance. PathwayPulse uses the Grok xAI Responses API (`x_search` tool) as the only reliable free-access path to public X posts.
 
 ---
 
@@ -196,7 +199,7 @@ See [Future Directions](#future-directions-1) below for the full list.
 | `tenacity` | Exponential backoff retry logic |
 | `playwright` | Headless browser automation (Bright Data Scraping Browser) |
 | `python-dotenv` | `.env` file loading |
-| `tweepy` | Twitter API client (optional) |
+| `openai` (pointed at `api.x.ai`) | Grok xAI Responses API for x_search KOL ingestion |
 
 ---
 

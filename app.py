@@ -60,12 +60,17 @@ st.markdown(
 # the script) never re-triggers the scrapers or AI APIs.
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_ingest(pathway: str, days_back: int, include_chemrxiv: bool) -> list[dict]:
+def cached_ingest(
+    pathway: str,
+    days_back: int,
+    include_chemrxiv: bool,
+    kol_handles: tuple,          # tuple (not list) so @st.cache_data can hash it
+) -> list[dict]:
     return asyncio.run(
         ingest_all(
             pathway_hint=pathway,
             reddit_subreddits=["biotech", "investing", "stocks"],
-            twitter_handles=[],
+            twitter_handles=list(kol_handles),
             days_back=days_back,
             include_chemrxiv=include_chemrxiv,
         )
@@ -77,9 +82,10 @@ def cached_pipeline(
     pathway: str,
     days_back: int,
     include_chemrxiv: bool,
+    kol_handles: tuple,
     model: str,
 ) -> tuple[list[dict], str]:
-    records = cached_ingest(pathway, days_back, include_chemrxiv)
+    records = cached_ingest(pathway, days_back, include_chemrxiv, kol_handles)
     events, report = asyncio.run(
         run_pipeline(records, pathway, executioner_model=model)
     )
@@ -191,6 +197,37 @@ with st.sidebar:
     days_back = st.slider("Days of preprint history", min_value=1, max_value=14, value=3)
     include_chemrxiv = st.checkbox("Include ChemRxiv (preclinical)", value=False)
 
+    st.markdown("**X / Twitter KOL Handles** (optional)")
+
+    # Load default handles from kol_handles.json if present
+    _default_handles: list[str] = []
+    try:
+        import json as _json, pathlib as _pathlib
+        _kol_path = _pathlib.Path(__file__).parent / "kol_handles.json"
+        if _kol_path.exists():
+            _default_handles = _json.loads(_kol_path.read_text()).get("handles", [])
+    except Exception:
+        pass
+
+    kol_input = st.text_area(
+        "One handle per line or comma-separated",
+        value="\n".join(_default_handles),
+        placeholder="EricTopol\nBioPharmaDive\nAdamFeuerstein",
+        height=100,
+        help=(
+            "Grok searches recent public posts from these accounts for pathway signals. "
+            "Requires XAI_API_KEY in .env. Max 20 handles — extras are ignored."
+        ),
+    )
+    kol_handles: tuple = tuple(
+        h.strip().lstrip("@")
+        for h in kol_input.replace(",", "\n").splitlines()
+        if h.strip()
+    )
+
+    if kol_handles and not os.getenv("XAI_API_KEY"):
+        st.caption("⚠ XAI_API_KEY not set — X/Twitter ingestion disabled")
+
     st.markdown("**AI Executioner Model**")
     model_choice = st.selectbox(
         "Report model",
@@ -238,9 +275,14 @@ if run_btn and pathway_input.strip():
         progress = st.progress(0, text="Ingesting data sources...")
 
         try:
-            progress.progress(20, text="Scraping bioRxiv, medRxiv, Reddit...")
+            ingest_label = "Scraping bioRxiv, medRxiv, Reddit"
+            if kol_handles and os.getenv("XAI_API_KEY"):
+                ingest_label += f", X/Twitter KOLs ({len(kol_handles)} handles)"
+            ingest_label += "..."
+            progress.progress(20, text=ingest_label)
+
             event_dicts, report = cached_pipeline(
-                pathway, days_back, include_chemrxiv, model_choice
+                pathway, days_back, include_chemrxiv, kol_handles, model_choice
             )
             progress.progress(80, text="Building Arbitrage Matrix...")
 
@@ -251,7 +293,7 @@ if run_btn and pathway_input.strip():
                 "pathway": pathway,
                 "events": events,
                 "report": report,
-                "record_count": len(cached_ingest(pathway, days_back, include_chemrxiv)),
+                "record_count": len(cached_ingest(pathway, days_back, include_chemrxiv, kol_handles)),
             }
             st.session_state["flow_state"] = _build_flow_state(pathway, events)
             progress.progress(100, text="Done.")

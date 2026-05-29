@@ -1,10 +1,10 @@
 """
 PathwayPulse — Ingestion Swarm
 Four agents feed raw text into the AI orchestrator:
-  1. extract_reddit_playwright — biotech community signal via Bright Data Scraping Browser
-  2. fetch_preprints           — bioRxiv + medRxiv clinical preprints (shared paginator)
-  3. fetch_twitter_kol         — KOL tweets (optional; free tier returns [])
-  4. fetch_chemrxiv            — preclinical pharmacology (stretch goal)
+  1. extract_reddit_alpha   — biotech community signal via public Atom RSS feed
+  2. fetch_preprints        — bioRxiv + medRxiv clinical preprints (shared paginator)
+  3. fetch_x_kol_grok       — KOL tweets via Grok xAI x_search tool (optional)
+  4. fetch_chemrxiv         — preclinical pharmacology (stretch goal)
 """
 from __future__ import annotations
 
@@ -184,57 +184,115 @@ async def fetch_all_preprints(days_back: int = 3) -> list[dict]:
     return combined
 
 
-# ── 3. Twitter KOL (optional, free-tier graceful fallback) ───────────────────
+# ── 3. X / Twitter KOL via Grok x_search ─────────────────────────────────────
+# Uses xAI's official Responses API with the x_search tool.
+# No Twitter developer account needed — Grok fetches public X data on our behalf.
+# One API call per analysis run covers all handles in a single request.
+# Cost: ~$0.005 per run at $5/1,000 x_search calls with 1-hour caching.
 
-def fetch_twitter_kol(handles: Optional[List[str]] = None) -> list[dict]:
+_XAI_BASE_URL = "https://api.x.ai/v1"
+_XAI_MODEL = "grok-3-latest"
+_MAX_HANDLES = 20  # xAI API limit for allowed_x_handles
+
+
+def fetch_x_kol_grok(
+    handles: Optional[List[str]] = None,
+    pathway: str = "",
+    days_back: int = 3,
+) -> list[dict]:
     """
-    Fetch recent tweets from a list of KOL Twitter handles.
-    Returns [] if TWITTER_BEARER_TOKEN is unset or if the free tier blocks reads.
-    Never raises; pipeline continues unaffected.
+    Fetch recent X/Twitter posts from a curated list of KOL handles using
+    the Grok xAI Responses API with the x_search tool.
+
+    Returns [] if XAI_API_KEY is not set or handles list is empty.
+    Truncates to 20 handles (xAI API limit) with a logged warning.
+    Never raises — pipeline continues unaffected on any failure.
     """
-    token = os.getenv("TWITTER_BEARER_TOKEN")
-    if not token:
-        log.info("TWITTER_BEARER_TOKEN not set — Twitter agent returning [] (free tier is write-only)")
+    api_key = os.getenv("XAI_API_KEY")
+    if not api_key:
+        log.info("XAI_API_KEY not set — Grok KOL agent returning [] (set key to enable X/Twitter ingestion)")
         return []
 
+    handles = [h.lstrip("@").strip() for h in (handles or []) if h.strip()]
     if not handles:
-        handles = []
+        log.info("No KOL handles provided — Grok agent returning []")
+        return []
+
+    if len(handles) > _MAX_HANDLES:
+        log.warning(
+            "KOL handle list has %d entries — truncating to first %d (xAI API limit)",
+            len(handles), _MAX_HANDLES,
+        )
+        handles = handles[:_MAX_HANDLES]
+
+    from_date = (date.today() - timedelta(days=days_back)).isoformat()
+    pathway_clause = f" related to {pathway}" if pathway else ""
+
+    prompt = (
+        f"Search recent public X posts from these accounts{pathway_clause}. "
+        f"Return a JSON array (no markdown, no explanation) where each element has: "
+        f'"handle" (string), "text" (full post text), "url" (post URL or empty string). '
+        f"Include only posts that are substantively about biology, medicine, drug development, "
+        f"or clinical research. Return an empty array [] if nothing relevant is found."
+    )
 
     try:
-        import tweepy
-        client = tweepy.Client(bearer_token=token)
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url=_XAI_BASE_URL)
+
+        response = client.responses.create(
+            model=_XAI_MODEL,
+            input=[{"role": "user", "content": prompt}],
+            tools=[{
+                "type": "x_search",
+                "allowed_x_handles": handles,
+                "from_date": from_date,
+            }],
+        )
+
+        # Extract text content from the response
+        raw = ""
+        for item in response.output:
+            if hasattr(item, "content"):
+                for block in item.content:
+                    if hasattr(block, "text"):
+                        raw += block.text
+
+        # Strip accidental markdown code fences
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        if not raw or raw == "[]":
+            log.info("Grok x_search: no relevant posts found for handles %s", handles)
+            return []
+
+        import json as _json
+        posts = _json.loads(raw)
+        if not isinstance(posts, list):
+            log.warning("Grok x_search: unexpected response shape — expected list, got %s", type(posts))
+            return []
+
         results = []
-        for handle in handles:
-            try:
-                user_resp = client.get_user(username=handle)
-                if not user_resp.data:
-                    continue
-                tweets_resp = client.get_users_tweets(
-                    id=user_resp.data.id,
-                    max_results=10,
-                    tweet_fields=["text", "created_at"],
-                )
-                for tweet in (tweets_resp.data or []):
-                    results.append({
-                        "source": "twitter",
-                        "handle": handle,
-                        "text": tweet.text,
-                        "created_at": str(tweet.created_at),
-                    })
-            except Exception as inner:
-                msg = str(inner)
-                if "403" in msg or "Forbidden" in msg:
-                    log.warning(
-                        "Twitter free tier is read-restricted for @%s — "
-                        "upgrade to Basic ($100/mo) for read access",
-                        handle,
-                    )
-                else:
-                    log.warning("Twitter fetch failed for @%s: %s", handle, inner)
-        log.info("Twitter: fetched %d tweets from %d handles", len(results), len(handles))
+        for post in posts:
+            if not isinstance(post, dict):
+                continue
+            text = str(post.get("text", "")).strip()
+            if not text:
+                continue
+            results.append({
+                "source": "twitter",
+                "handle": str(post.get("handle", "")),
+                "title": text[:80],
+                "body": text,
+                "url": str(post.get("url", "")),
+            })
+
+        log.info("Grok x_search: %d relevant posts from %d handles", len(results), len(handles))
         return results
+
     except Exception as e:
-        log.warning("Twitter agent failed (%s) — returning []", e)
+        log.warning("Grok x_search agent failed (%s: %s) — returning []", type(e).__name__, e)
         return []
 
 
@@ -325,7 +383,9 @@ async def ingest_all(
     # for the same Bright Data browser session; parallel sessions cost extra bandwidth
     reddit_tasks = [extract_reddit_playwright(sub, 50) for sub in subreddits]
     preprint_task = fetch_all_preprints(days_back)
-    twitter_task = loop.run_in_executor(None, fetch_twitter_kol, twitter_handles or [])
+    twitter_task = loop.run_in_executor(
+        None, fetch_x_kol_grok, twitter_handles or [], pathway_hint, days_back
+    )
 
     reddit_results, preprint_results, twitter_results = await asyncio.gather(
         asyncio.gather(*reddit_tasks, return_exceptions=True),
@@ -356,6 +416,12 @@ if __name__ == "__main__":
         print(f"\nReddit posts from r/biotech: {len(posts)}")
         for p in posts[:5]:
             print(f"  [{p['score']:>5}] {p['title'][:80]}")
+
+        # Grok x_search demo (requires XAI_API_KEY in .env)
+        kol_posts = fetch_x_kol_grok(["EricTopol", "BioPharmaDive"], "IL-6 signaling", days_back=3)
+        print(f"\nGrok KOL posts: {len(kol_posts)}")
+        for p in kol_posts[:3]:
+            print(f"  @{p['handle']}: {p['body'][:80]}")
 
         # Full ingest (preprints only if no Bright Data key)
         records = await ingest_all(days_back=1, include_chemrxiv=False)
