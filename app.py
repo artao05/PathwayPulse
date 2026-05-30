@@ -13,7 +13,7 @@ from streamlit_flow.layouts import TreeLayout
 from streamlit_flow.state import StreamlitFlowState
 
 from ai_orchestrator import CrossPollinationEvent, run_pipeline
-from swarm_ingestion import ingest_all
+from swarm_ingestion import fetch_conference_abstracts, fetch_trial_catalysts, ingest_all
 
 load_dotenv()
 
@@ -64,6 +64,10 @@ def cached_ingest(
     pathway: str,
     days_back: int,
     include_chemrxiv: bool,
+    include_clinicaltrials: bool,
+    drug: str,
+    sponsor: str,
+    conference_list: tuple,      # tuple for hashability ("acr", "ash", "asco")
     kol_handles: tuple,          # tuple (not list) so @st.cache_data can hash it
     reddit_subs: tuple,          # tuple for hashability
 ) -> list[dict]:
@@ -74,8 +78,25 @@ def cached_ingest(
             twitter_handles=list(kol_handles),
             days_back=days_back,
             include_chemrxiv=include_chemrxiv,
+            include_clinicaltrials=include_clinicaltrials,
+            drug=drug,
+            sponsor=sponsor,
+            conference_list=list(conference_list),
         )
     )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_catalysts(
+    pathway: str,
+    drug: str,
+    sponsor: str,
+    include_catalysts: bool,
+) -> list[dict]:
+    """Fetch Catalyst Calendar records via BrightData + API v2 enrichment."""
+    if not include_catalysts:
+        return []
+    return asyncio.run(fetch_trial_catalysts(pathway=pathway, drug=drug, sponsor=sponsor))
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -83,13 +104,22 @@ def cached_pipeline(
     pathway: str,
     days_back: int,
     include_chemrxiv: bool,
+    include_clinicaltrials: bool,
+    drug: str,
+    sponsor: str,
+    include_catalysts: bool,
+    conference_list: tuple,
     kol_handles: tuple,
     reddit_subs: tuple,
     model: str,
 ) -> tuple[list[dict], str]:
-    records = cached_ingest(pathway, days_back, include_chemrxiv, kol_handles, reddit_subs)
+    records = cached_ingest(
+        pathway, days_back, include_chemrxiv, include_clinicaltrials,
+        drug, sponsor, conference_list, kol_handles, reddit_subs,
+    )
+    cats = cached_catalysts(pathway, drug, sponsor, include_catalysts)
     events, report = asyncio.run(
-        run_pipeline(records, pathway, executioner_model=model)
+        run_pipeline(records, pathway, executioner_model=model, catalysts=cats or None)
     )
     return [e.model_dump() for e in events], report
 
@@ -195,9 +225,80 @@ with st.sidebar:
         help="The pathway you want to track across therapeutic areas.",
     )
 
+    st.markdown("**Drug / Pipeline Filter** (optional)")
+    drug_input = st.text_input(
+        "Drug or intervention name",
+        value="",
+        placeholder="e.g. tocilizumab, ruxolitinib, CAR-T",
+        help=(
+            "Narrows ClinicalTrials.gov searches to a specific drug or intervention. "
+            "Leave blank to search by pathway only."
+        ),
+    )
+    drug = drug_input.strip()
+
+    sponsor_input = st.text_input(
+        "Sponsor / company name",
+        value="",
+        placeholder="e.g. Roche, Pfizer, AbbVie",
+        help="Optionally filter ClinicalTrials.gov results to a specific lead sponsor.",
+    )
+    sponsor = sponsor_input.strip()
+
     st.markdown("**Data Sources**")
     days_back = st.slider("Days of preprint history", min_value=1, max_value=14, value=3)
     include_chemrxiv = st.checkbox("Include ChemRxiv (preclinical)", value=False)
+
+    _has_brightdata = bool(os.getenv("BRIGHTDATA_BROWSER_AUTH"))
+    include_clinicaltrials = st.checkbox(
+        "Include ClinicalTrials.gov text records",
+        value=_has_brightdata,
+        disabled=not _has_brightdata,
+        help=(
+            "Scrapes active/recruiting trials matching your pathway via "
+            "Bright Data Scraping Browser. Requires BRIGHTDATA_BROWSER_AUTH in .env."
+            if _has_brightdata
+            else "Set BRIGHTDATA_BROWSER_AUTH in .env to enable ClinicalTrials.gov scraping."
+        ),
+    )
+    if include_clinicaltrials and not _has_brightdata:
+        include_clinicaltrials = False
+
+    include_catalysts = st.checkbox(
+        "Show Catalyst Calendar",
+        value=True,
+        help=(
+            "Surfaces upcoming / overdue trial readouts with start date, expected "
+            "primary-completion date, and days-until-readout. Uses BrightData for "
+            "discovery when available, otherwise queries ClinicalTrials.gov API v2 directly."
+        ),
+    )
+
+    _conf_options = {
+        "acr":  "ACR (Rheumatology)",
+        "asco": "ASCO (Oncology) — NGO risk",
+    }
+    if _has_brightdata:
+        _conf_selected = st.multiselect(
+            "Conference abstracts (BrightData)",
+            options=list(_conf_options.keys()),
+            default=["acr"],
+            format_func=lambda k: _conf_options[k],
+            help=(
+                "Scrape meeting abstracts — the earliest public disclosure of "
+                "clinical trial data, months before bioRxiv. "
+                "ACR is green-tier (open robots.txt). "
+                "ASCO carries NGO-classification risk and returns [] if blocked "
+                "(requires BrightData KYC to unlock)."
+            ),
+        )
+    else:
+        st.caption(
+            "Conference abstracts disabled — set BRIGHTDATA_BROWSER_AUTH in .env to enable."
+        )
+        _conf_selected = []
+
+    conference_list: tuple = tuple(_conf_selected)
 
     st.markdown("**Reddit Subreddits**")
 
@@ -276,10 +377,10 @@ with st.sidebar:
     if st.button("🗑 Clear Cache", use_container_width=True):
         cached_ingest.clear()
         cached_pipeline.clear()
-        if "flow_state" in st.session_state:
-            del st.session_state["flow_state"]
-        if "pipeline_results" in st.session_state:
-            del st.session_state["pipeline_results"]
+        cached_catalysts.clear()
+        for key in ("flow_state", "pipeline_results"):
+            if key in st.session_state:
+                del st.session_state[key]
         st.success("Cache cleared.")
 
 
@@ -305,25 +406,41 @@ if run_btn and pathway_input.strip():
             if len(reddit_subs) > 3:
                 sub_names += f" +{len(reddit_subs) - 3} more"
             ingest_label = f"Scraping bioRxiv, medRxiv, Reddit ({sub_names})"
+            if include_clinicaltrials:
+                ingest_label += ", ClinicalTrials.gov"
+            if conference_list:
+                conf_names = ", ".join(c.upper() for c in conference_list)
+                ingest_label += f", {conf_names} abstracts"
             if kol_handles and os.getenv("XAI_API_KEY"):
                 ingest_label += f", X/Twitter KOLs ({len(kol_handles)} handles)"
             ingest_label += "..."
             progress.progress(20, text=ingest_label)
 
             event_dicts, report = cached_pipeline(
-                pathway, days_back, include_chemrxiv, kol_handles, reddit_subs, model_choice
+                pathway, days_back, include_chemrxiv, include_clinicaltrials,
+                drug, sponsor, include_catalysts, conference_list, kol_handles,
+                reddit_subs, model_choice,
             )
-            progress.progress(80, text="Building Arbitrage Matrix...")
+            progress.progress(70, text="Building Arbitrage Matrix...")
 
             events = [CrossPollinationEvent(**d) for d in event_dicts]
+
+            _records = cached_ingest(
+                pathway, days_back, include_chemrxiv, include_clinicaltrials,
+                drug, sponsor, conference_list, kol_handles, reddit_subs,
+            )
+            _catalysts = cached_catalysts(pathway, drug, sponsor, include_catalysts)
 
             # Store in session_state to persist across re-renders
             st.session_state["pipeline_results"] = {
                 "pathway": pathway,
                 "events": events,
                 "report": report,
-                "record_count": len(cached_ingest(pathway, days_back, include_chemrxiv, kol_handles, reddit_subs)),
-                "records": cached_ingest(pathway, days_back, include_chemrxiv, kol_handles, reddit_subs),
+                "record_count": len(_records),
+                "records": _records,
+                "catalysts": _catalysts,
+                "drug": drug,
+                "sponsor": sponsor,
             }
             st.session_state["flow_state"] = _build_flow_state(pathway, events)
             progress.progress(100, text="Done.")
@@ -342,9 +459,14 @@ if "pipeline_results" in st.session_state:
     report: str = results["report"]
     record_count: int = results["record_count"]
     raw_records: list[dict] = results.get("records", [])
+    catalysts: list[dict] = results.get("catalysts", [])
 
-    # Metrics row
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    # Metrics row — expand to 5 cols when catalysts are present
+    if catalysts:
+        col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+    else:
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+
     with col_m1:
         st.metric("Records Ingested", record_count)
     with col_m2:
@@ -358,6 +480,20 @@ if "pipeline_results" in st.session_state:
             if events else "—"
         )
         st.metric("Avg Confidence", avg_conf)
+    if catalysts:
+        with col_m5:
+            actionable = [c for c in catalysts if c["bucket"] in ("overdue", "imminent")]
+            near_cat = next(
+                (c for c in catalysts if c["days_until_readout"] is not None
+                 and c["days_until_readout"] >= 0 and not c["results_posted"]),
+                None,
+            )
+            if near_cat and near_cat["days_until_readout"] is not None:
+                st.metric("Next Readout", f"{near_cat['days_until_readout']}d",
+                          delta=f"{len(actionable)} imminent" if actionable else None,
+                          delta_color="inverse")
+            else:
+                st.metric("Trials Tracked", len(catalysts))
 
     st.markdown("---")
 
@@ -414,6 +550,102 @@ if "pipeline_results" in st.session_state:
                 if i < len(events) - 1:
                     st.markdown("---")
 
+    # ── Catalyst Calendar ──────────────────────────────────────────────────────
+    if catalysts:
+        _BUCKET_ICON = {
+            "overdue": "🔴",
+            "imminent": "🟠",
+            "near": "🟡",
+            "upcoming": "🔵",
+            "reported": "✅",
+        }
+        _BUCKET_LABEL = {
+            "overdue":  "Overdue — results expected, none posted",
+            "imminent": "Imminent — readout within 90 days",
+            "near":     "Near-term — readout 91–180 days out",
+            "upcoming": "Upcoming — readout > 180 days or TBD",
+            "reported": "Reported — results already posted",
+        }
+
+        with st.expander(
+            f"📅 Catalyst Calendar — {len(catalysts)} trials tracked",
+            expanded=True,
+        ):
+            # Group by bucket in priority order
+            bucket_order = ["overdue", "imminent", "near", "upcoming", "reported"]
+            grouped_cats: dict[str, list[dict]] = {b: [] for b in bucket_order}
+            for cat in catalysts:
+                grouped_cats.setdefault(cat["bucket"], []).append(cat)
+
+            for bucket in bucket_order:
+                bucket_cats = grouped_cats.get(bucket, [])
+                if not bucket_cats:
+                    continue
+
+                icon = _BUCKET_ICON.get(bucket, "•")
+                label = _BUCKET_LABEL.get(bucket, bucket.title())
+                st.markdown(f"**{icon} {label}** ({len(bucket_cats)})")
+
+                for cat in bucket_cats:
+                    nct_id = cat.get("nct_id", "")
+                    title  = cat.get("title", nct_id)
+                    url    = cat.get("url", f"https://clinicaltrials.gov/study/{nct_id}")
+                    phase  = cat.get("phase", "")
+                    status = cat.get("status", "")
+                    sponsor_name = cat.get("lead_sponsor", "")
+                    interventions = cat.get("interventions", [])
+                    conditions = cat.get("conditions", [])
+                    pc_date = cat.get("primary_completion_date", "")
+                    pc_type = cat.get("primary_completion_type", "")
+                    start   = cat.get("start_date", "")
+                    window  = cat.get("readout_window", "TBD")
+                    days    = cat.get("days_until_readout")
+
+                    # Days-until badge
+                    if days is None:
+                        days_badge = "TBD"
+                    elif days < 0:
+                        days_badge = f"{abs(days)}d overdue"
+                    else:
+                        days_badge = f"{days}d"
+
+                    # Build compact one-liner
+                    parts = []
+                    if phase:
+                        parts.append(phase)
+                    if status:
+                        parts.append(status)
+                    if sponsor_name:
+                        parts.append(f"*{sponsor_name}*")
+                    meta = " · ".join(parts)
+
+                    pc_label = f"{pc_date}"
+                    if pc_type == "ESTIMATED":
+                        pc_label += " (est.)"
+
+                    drug_str = ", ".join(interventions[:3]) if interventions else ""
+                    cond_str = ", ".join(conditions[:2]) if conditions else ""
+
+                    col_title, col_readout, col_badge = st.columns([5, 2, 1])
+                    with col_title:
+                        st.markdown(f"[{title[:90]}]({url})")
+                        detail_parts = []
+                        if meta:
+                            detail_parts.append(meta)
+                        if drug_str:
+                            detail_parts.append(f"Drug: {drug_str}")
+                        if cond_str:
+                            detail_parts.append(f"Conditions: {cond_str}")
+                        if start:
+                            detail_parts.append(f"Started: {start}")
+                        st.caption(" · ".join(detail_parts))
+                    with col_readout:
+                        st.caption(f"Readout: {pc_label}" if pc_date else f"Window: {window}")
+                    with col_badge:
+                        st.caption(days_badge)
+
+                st.markdown("")
+
     # Ingested Sources expander — all raw records with links grouped by source type
     if raw_records:
         from collections import defaultdict
@@ -421,7 +653,7 @@ if "pipeline_results" in st.session_state:
         for rec in raw_records:
             grouped[rec.get("source", "unknown")].append(rec)
 
-        source_order = ["biorxiv", "medrxiv", "chemrxiv", "reddit", "twitter"]
+        source_order = ["biorxiv", "medrxiv", "chemrxiv", "clinicaltrials", "acr", "asco", "reddit", "twitter"]
         ordered_keys = [k for k in source_order if k in grouped] + [
             k for k in grouped if k not in source_order
         ]
@@ -431,7 +663,9 @@ if "pipeline_results" in st.session_state:
                 recs = grouped[src_key]
                 label_map = {
                     "biorxiv": "bioRxiv", "medrxiv": "medRxiv",
-                    "chemrxiv": "ChemRxiv", "reddit": "Reddit", "twitter": "X / Twitter",
+                    "chemrxiv": "ChemRxiv", "clinicaltrials": "ClinicalTrials.gov",
+                    "acr": "ACR Abstracts", "asco": "ASCO Abstracts",
+                    "reddit": "Reddit", "twitter": "X / Twitter",
                 }
                 src_display = label_map.get(src_key, src_key.title())
                 st.markdown(f"**{src_display}** — {len(recs)} records")

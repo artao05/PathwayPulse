@@ -15,7 +15,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
@@ -44,6 +44,26 @@ class CrossPollinationEvent(BaseModel):
 class TriageResult(BaseModel):
     events: list[CrossPollinationEvent]
     is_relevant: bool = Field(description="True if any cross-pollination signal was detected")
+
+
+class TrialCatalyst(BaseModel):
+    """Structured clinical trial catalyst — dates are authoritative from API v2, not LLM-generated."""
+    nct_id: str = Field(description="ClinicalTrials.gov NCT identifier")
+    title: str = Field(description="Brief title of the study")
+    url: str = Field(default="", description="ClinicalTrials.gov study URL")
+    lead_sponsor: str = Field(default="", description="Lead sponsor name")
+    phase: str = Field(default="", description="Trial phase(s), e.g. 'Phase 2, Phase 3'")
+    status: str = Field(default="", description="Overall status, e.g. 'Recruiting'")
+    interventions: list[str] = Field(default_factory=list, description="Drug / intervention names")
+    conditions: list[str] = Field(default_factory=list, description="Target conditions / diseases")
+    start_date: str = Field(default="", description="Study start date (YYYY-MM-DD)")
+    primary_completion_date: str = Field(default="", description="Expected primary completion / readout date")
+    primary_completion_type: str = Field(default="", description="ACTUAL or ESTIMATED")
+    completion_date: str = Field(default="", description="Expected full study completion date")
+    readout_window: str = Field(default="TBD", description="Quarter readout window, e.g. 'Q3 2026'")
+    days_until_readout: Optional[int] = Field(default=None, description="Days until primary completion (negative = overdue)")
+    bucket: str = Field(default="upcoming", description="overdue | imminent | near | upcoming | reported")
+    results_posted: bool = Field(default=False, description="Whether results are already posted")
 
 
 # ── Synthesizer (DeepSeek-V3 via AI/ML API) ───────────────────────────────────
@@ -196,7 +216,8 @@ async def triage_data_batch(
 _EXECUTIONER_SYSTEM = """\
 You are a senior biotech analyst with deep expertise in immunology, oncology, and drug
 repurposing strategy. You have been given a set of detected biological pathway
-cross-pollination signals, each with a confidence score and source evidence.
+cross-pollination signals and (optionally) a Catalyst Calendar of upcoming clinical trial
+readouts.
 
 Your task: write a concise, rigorous arbitrage intelligence report in Markdown.
 
@@ -206,13 +227,18 @@ Structure your report as follows:
    mechanistically plausible given the pathway's biology
 3. **Signal Quality** — Rank the top signals by confidence and explain what makes each
    credible or speculative
-4. **Risk Factors** — What could invalidate these signals (competing pathways, trial failures,
+4. **Catalyst Calendar** — If trial catalysts are provided, highlight the most time-sensitive
+   binary events: overdue readouts, imminent readouts (<90 days), and near-term readouts
+   (90–180 days). Call out which catalysts could be market-moving and why. Include a
+   markdown link to each trial using its url field. If no catalysts were provided, omit
+   this section entirely.
+5. **Risk Factors** — What could invalidate these signals (competing pathways, trial failures,
    regulatory hurdles)?
-5. **Watch List** — Specific companies, trials, or papers to monitor
+6. **Watch List** — Specific companies, trials, or papers to monitor
 
 Be direct. Use scientific terminology. Do not hedge excessively.
-When citing a specific signal or paper, include a markdown hyperlink using the source_url
-field if it is non-empty, e.g. [paper title](https://...).
+When citing a signal or paper, include a markdown hyperlink using the source_url field if
+non-empty, e.g. [paper title](https://...).
 """
 
 
@@ -220,13 +246,15 @@ def generate_arbitrage_report(
     events: list[CrossPollinationEvent],
     pathway: str,
     model: str = "gpt-4o",
+    catalysts: Optional[list[dict]] = None,
 ) -> str:
     """
-    Generate a Bear/Bull/Neutral arbitrage report from detected CrossPollinationEvents.
+    Generate a Bear/Bull/Neutral arbitrage report from detected CrossPollinationEvents
+    and (optionally) a list of TrialCatalyst dicts from the Catalyst Calendar.
     Routes to gpt-4o (or o1 if specified) via standard OpenAI.
     Returns a markdown string.
     """
-    if not events:
+    if not events and not catalysts:
         return (
             f"## PathwayPulse Report — {pathway}\n\n"
             "**Verdict: Neutral**\n\n"
@@ -246,9 +274,25 @@ def generate_arbitrage_report(
     )
     user_prompt = (
         f"Biological pathway: {pathway}\n\n"
-        f"Detected CrossPollinationEvents ({len(events)} total):\n```json\n{events_payload}\n```\n\n"
-        "Write the arbitrage intelligence report now."
+        f"Detected CrossPollinationEvents ({len(events)} total):\n```json\n{events_payload}\n```\n"
     )
+
+    if catalysts:
+        # Surface only the most actionable catalysts to the Executioner
+        actionable = [
+            c for c in catalysts
+            if c.get("bucket") in ("overdue", "imminent", "near")
+        ][:15]
+        if not actionable:
+            actionable = catalysts[:10]
+        cat_payload = json.dumps(actionable, indent=2)
+        user_prompt += (
+            f"\nCatalyst Calendar ({len(catalysts)} trials tracked, "
+            f"{len(actionable)} shown below — overdue/imminent/near only):\n"
+            f"```json\n{cat_payload}\n```\n"
+        )
+
+    user_prompt += "\nWrite the arbitrage intelligence report now."
 
     try:
         resp = client.chat.completions.create(
@@ -275,14 +319,18 @@ async def run_pipeline(
     pathway: str,
     executioner_model: str = "gpt-4o",
     concurrency: int = 10,
+    catalysts: Optional[list[dict]] = None,
 ) -> tuple[list[CrossPollinationEvent], str]:
     """
     Run the complete dual-model pipeline:
-      records → Synthesizer → events → Executioner → report
+      records → Synthesizer → events → Executioner (+ catalysts) → report
     Returns (events, markdown_report).
+    Catalysts are passed through to the Executioner but are not triage-processed.
     """
     events = await triage_data_batch(records, pathway, concurrency=concurrency)
-    report = generate_arbitrage_report(events, pathway, model=executioner_model)
+    report = generate_arbitrage_report(
+        events, pathway, model=executioner_model, catalysts=catalysts
+    )
     return events, report
 
 

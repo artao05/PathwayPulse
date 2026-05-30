@@ -1,10 +1,12 @@
 """
 PathwayPulse — Ingestion Swarm
-Four agents feed raw text into the AI orchestrator:
-  1. extract_reddit_alpha   — biotech community signal via public Atom RSS feed
-  2. fetch_preprints        — bioRxiv + medRxiv clinical preprints (shared paginator)
-  3. fetch_x_kol_grok       — KOL tweets via Grok xAI x_search tool (optional)
-  4. fetch_chemrxiv         — preclinical pharmacology (stretch goal)
+Agents feed raw text into the AI orchestrator:
+  1. extract_reddit_alpha          — biotech community signal via public Atom RSS feed
+  2. fetch_preprints               — bioRxiv + medRxiv clinical preprints (shared paginator)
+  3. fetch_x_kol_grok              — KOL tweets via Grok xAI x_search tool (optional)
+  4. fetch_clinicaltrials_brightdata — ClinicalTrials.gov via BrightData Scraping Browser
+  5. fetch_trial_catalysts         — Catalyst Calendar: BrightData discovery + API v2 enrichment
+  6. fetch_chemrxiv                — preclinical pharmacology (stretch goal)
 """
 from __future__ import annotations
 
@@ -25,6 +27,12 @@ log = logging.getLogger(__name__)
 
 _BIORXIV_BASE = "https://api.biorxiv.org/details/{server}/{start}/{end}/{cursor}"
 _CHEMRXIV_BASE = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
+_CT_API_BASE = "https://clinicaltrials.gov/api/v2/studies"
+_CT_FIELDS = (
+    "NCTId,BriefTitle,OverallStatus,StartDateStruct,PrimaryCompletionDateStruct,"
+    "CompletionDateStruct,ResultsFirstPostDateStruct,Phase,LeadSponsorName,"
+    "InterventionName,Condition"
+)
 _MAX_RECORDS_PER_SERVER = 300
 
 _PREPRINT_URL_BASES = {
@@ -331,7 +339,687 @@ def fetch_x_kol_grok(
         return []
 
 
-# ── 4. ChemRxiv (stretch goal — preclinical pharmacology) ────────────────────
+# ── 4. ClinicalTrials.gov via BrightData Scraping Browser ────────────────────
+# ClinicalTrials.gov is an Angular SPA with anti-bot measures; the Scraping
+# Browser handles JS rendering and evasion so we get the full rendered study list.
+# Returns [] gracefully if BRIGHTDATA_BROWSER_AUTH is not set.
+
+async def fetch_clinicaltrials_brightdata(
+    pathway: str,
+    drug: str = "",
+    sponsor: str = "",
+    max_results: int = 30,
+) -> list[dict]:
+    """
+    Scrape active/recruiting ClinicalTrials.gov studies matching the pathway
+    (and optionally drug/sponsor) via BrightData Scraping Browser (CDP WebSocket).
+
+    Each returned record has: source, nct_id, url, source_label, title,
+    abstract (phase + status + conditions), phase, status, conditions.
+    Returns [] on any error so the pipeline is never blocked.
+    """
+    auth = os.getenv("BRIGHTDATA_BROWSER_AUTH")
+    if not auth:
+        log.info("BRIGHTDATA_BROWSER_AUTH not set — ClinicalTrials agent returning []")
+        return []
+
+    if not pathway and not drug and not sponsor:
+        return []
+
+    import urllib.parse
+    from playwright.async_api import async_playwright
+
+    ws_url = f"wss://{auth}@brd.superproxy.io:9222"
+    term_parts = [p for p in [pathway, drug] if p]
+    query = urllib.parse.quote(" ".join(term_parts))
+    # aggFilters=status:rec%20act → recruiting + active not recruiting (highest-signal)
+    search_url = f"https://clinicaltrials.gov/search?term={query}&aggFilters=status:rec%20act"
+    if sponsor:
+        search_url += f"&spons={urllib.parse.quote(sponsor)}"
+
+    results: list[dict] = []
+    try:
+        async with async_playwright() as p:
+            log.info("ClinicalTrials: connecting to BrightData Scraping Browser...")
+            browser = await asyncio.wait_for(
+                p.chromium.connect_over_cdp(ws_url), timeout=30
+            )
+            page = await browser.new_page()
+
+            log.info("ClinicalTrials: navigating to search for '%s'", pathway)
+            await page.goto(search_url, wait_until="networkidle", timeout=60_000)
+
+            # Angular SPA needs a moment after networkidle to finish rendering
+            await page.wait_for_timeout(2500)
+
+            studies = await page.evaluate("""
+                () => {
+                    // ClinicalTrials.gov (2023+ redesign) renders Angular components;
+                    // try the known component names first, then generic fallbacks.
+                    const selectors = [
+                        'ctg-search-hit-card',
+                        '[data-testid="study-item"]',
+                        '.search-result-item',
+                        'article.search-result',
+                    ];
+                    let cards = [];
+                    for (const sel of selectors) {
+                        const found = document.querySelectorAll(sel);
+                        if (found.length > 0) { cards = Array.from(found); break; }
+                    }
+
+                    if (cards.length > 0) {
+                        return cards.map(card => {
+                            const getText = (sels) => {
+                                for (const s of sels) {
+                                    const el = card.querySelector(s);
+                                    if (el) return el.textContent.trim();
+                                }
+                                return '';
+                            };
+                            const linkEl = card.querySelector('a[href*="/study/NCT"], a[href*="/study/nct"]');
+                            const href = linkEl ? linkEl.getAttribute('href') : '';
+                            const nctMatch = href.match(/NCT\\d+/i);
+                            return {
+                                title:      getText(['h3', 'h2', '[class*="title"]', '.study-title']),
+                                nct_id:     nctMatch ? nctMatch[0].toUpperCase() : '',
+                                conditions: getText(['[class*="condition"]', '.conditions', '[aria-label*="ondition"]']),
+                                phase:      getText(['[class*="phase"]', '.phase', '[aria-label*="hase"]']),
+                                status:     getText(['[class*="status"]', '.status', '[aria-label*="tatus"]']),
+                                url:        href ? 'https://clinicaltrials.gov' + href : '',
+                            };
+                        });
+                    }
+
+                    // Fallback: harvest every NCT study link on the page
+                    const links = document.querySelectorAll('a[href*="/study/NCT"]');
+                    return Array.from(links).map(a => {
+                        const m = a.href.match(/NCT\\d+/i);
+                        return {
+                            title:      a.textContent.trim(),
+                            nct_id:     m ? m[0].toUpperCase() : '',
+                            conditions: '', phase: '', status: '',
+                            url:        a.href,
+                        };
+                    });
+                }
+            """)
+
+            await browser.close()
+
+            for study in (studies or [])[:max_results]:
+                title = (study.get("title") or "").strip()
+                if not title:
+                    continue
+                nct_id = study.get("nct_id", "")
+                url = study.get("url", "") or (
+                    f"https://clinicaltrials.gov/study/{nct_id}" if nct_id else ""
+                )
+                phase = study.get("phase", "")
+                status = study.get("status", "")
+                conditions = study.get("conditions", "")
+                abstract_parts = []
+                if phase:
+                    abstract_parts.append(f"Phase: {phase}")
+                if status:
+                    abstract_parts.append(f"Status: {status}")
+                if conditions:
+                    abstract_parts.append(f"Conditions: {conditions}")
+                results.append({
+                    "source": "clinicaltrials",
+                    "nct_id": nct_id,
+                    "url": url,
+                    "source_label": "ClinicalTrials.gov",
+                    "title": title,
+                    "abstract": ". ".join(abstract_parts) + "." if abstract_parts else "",
+                    "phase": phase,
+                    "status": status,
+                    "conditions": conditions,
+                })
+
+        log.info(
+            "ClinicalTrials BrightData: %d studies scraped for pathway '%s'",
+            len(results), pathway,
+        )
+
+    except asyncio.TimeoutError:
+        log.warning("ClinicalTrials: BrightData connection timed out")
+    except Exception as e:
+        log.warning(
+            "ClinicalTrials BrightData scrape failed (%s: %s) — returning []",
+            type(e).__name__, e,
+        )
+
+    return results
+
+
+# ── 5. Catalyst Calendar — BrightData discovery + API v2 enrichment ──────────
+# BrightData scrapes the Angular SPA to discover NCT IDs; the free ClinicalTrials.gov
+# API v2 then provides authoritative structured dates (primaryCompletionDateStruct,
+# startDateStruct) for each study. Falls back to pure API v2 query if BrightData
+# auth is absent. All catalyst fields are deterministic — no LLM involved.
+
+def _parse_ct_date_struct(struct: Optional[dict]) -> tuple[str, str]:
+    """Return (date_str as YYYY-MM-DD, type ACTUAL|ESTIMATED|'') from a CT date struct."""
+    if not struct:
+        return "", ""
+    raw = struct.get("date", "")
+    date_type = struct.get("type", "")
+    if len(raw) == 7:
+        raw = raw + "-01"
+    return raw, date_type
+
+
+def _readout_quarter(d: date) -> str:
+    return f"Q{(d.month - 1) // 3 + 1} {d.year}"
+
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _ct_api_get(params: dict) -> dict:
+    resp = requests.get(_CT_API_BASE, params=params, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def enrich_trials_via_api(nct_ids: list[str]) -> dict[str, dict]:
+    """
+    Fetch structured date / status / phase data for a list of NCT IDs from
+    the ClinicalTrials.gov API v2 (free, no auth). Returns {} on any failure.
+    Processes in chunks of 100 to respect URL length limits.
+    """
+    if not nct_ids:
+        return {}
+
+    enriched: dict[str, dict] = {}
+    chunk_size = 100
+    for i in range(0, len(nct_ids), chunk_size):
+        chunk = nct_ids[i : i + chunk_size]
+        try:
+            data = _ct_api_get({
+                "filter.ids": ",".join(chunk),
+                "fields": _CT_FIELDS,
+                "pageSize": len(chunk),
+                "format": "json",
+            })
+        except Exception as e:
+            log.warning("ClinicalTrials API v2 enrichment chunk %d failed: %s", i, e)
+            continue
+
+        for study in data.get("studies", []):
+            ps = study.get("protocolSection", {})
+            id_mod      = ps.get("identificationModule", {})
+            status_mod  = ps.get("statusModule", {})
+            design_mod  = ps.get("designModule", {})
+            sponsor_mod = ps.get("sponsorCollaboratorsModule", {})
+            interv_mod  = ps.get("armsInterventionsModule", {})
+            cond_mod    = ps.get("conditionsModule", {})
+            results_sec = study.get("resultsSection", {})
+
+            nct_id = id_mod.get("nctId", "")
+            if not nct_id:
+                continue
+
+            enriched[nct_id] = {
+                "nct_id": nct_id,
+                "title": id_mod.get("briefTitle", ""),
+                "overall_status": status_mod.get("overallStatus", ""),
+                "start_date_struct": status_mod.get("startDateStruct"),
+                "primary_completion_date_struct": status_mod.get("primaryCompletionDateStruct"),
+                "completion_date_struct": status_mod.get("completionDateStruct"),
+                "results_first_post_date_struct": results_sec.get("resultsFirstPostDateStruct"),
+                "phases": design_mod.get("phases", []),
+                "lead_sponsor": sponsor_mod.get("leadSponsor", {}).get("name", ""),
+                "interventions": [
+                    iv.get("name", "")
+                    for iv in interv_mod.get("interventions", [])
+                    if iv.get("name")
+                ],
+                "conditions": cond_mod.get("conditions", []),
+                "url": f"https://clinicaltrials.gov/study/{nct_id}",
+            }
+
+    log.info("ClinicalTrials API v2: enriched %d / %d NCT IDs", len(enriched), len(nct_ids))
+    return enriched
+
+
+def derive_catalysts(enriched: dict[str, dict]) -> list[dict]:
+    """
+    Compute days_until_readout, readout_window, and bucket for each study.
+
+    Buckets (in display priority order):
+      overdue  — past estimated primary completion, no results posted yet
+      imminent — within 90 days, no results posted
+      near     — 91–180 days out, no results posted
+      upcoming — > 180 days or no date, no results posted
+      reported — results already posted to ClinicalTrials.gov
+    """
+    today = date.today()
+    catalysts: list[dict] = []
+
+    for nct_id, study in enriched.items():
+        pc_str, pc_type = _parse_ct_date_struct(study.get("primary_completion_date_struct"))
+        start_str, _   = _parse_ct_date_struct(study.get("start_date_struct"))
+        comp_str, _    = _parse_ct_date_struct(study.get("completion_date_struct"))
+        results_struct  = study.get("results_first_post_date_struct")
+        results_posted  = bool(results_struct and results_struct.get("date"))
+
+        pc_date: Optional[date] = None
+        try:
+            if pc_str:
+                pc_date = date.fromisoformat(pc_str)
+        except ValueError:
+            pass
+
+        if pc_date:
+            days_until: Optional[int] = (pc_date - today).days
+            readout_window = _readout_quarter(pc_date)
+        else:
+            days_until = None
+            readout_window = "TBD"
+
+        if results_posted:
+            bucket = "reported"
+        elif days_until is None:
+            bucket = "upcoming"
+        elif days_until < 0:
+            bucket = "overdue"
+        elif days_until <= 90:
+            bucket = "imminent"
+        elif days_until <= 180:
+            bucket = "near"
+        else:
+            bucket = "upcoming"
+
+        phases = study.get("phases", [])
+        phase_str = ", ".join(
+            p.replace("PHASE", "Phase ").replace("_", " ").title()
+            for p in phases
+        )
+
+        catalysts.append({
+            "nct_id": nct_id,
+            "title": study.get("title", ""),
+            "url": study.get("url", f"https://clinicaltrials.gov/study/{nct_id}"),
+            "lead_sponsor": study.get("lead_sponsor", ""),
+            "phase": phase_str,
+            "status": study.get("overall_status", "").replace("_", " ").title(),
+            "interventions": study.get("interventions", []),
+            "conditions": study.get("conditions", []),
+            "start_date": start_str,
+            "primary_completion_date": pc_str,
+            "primary_completion_type": pc_type,
+            "completion_date": comp_str,
+            "readout_window": readout_window,
+            "days_until_readout": days_until,
+            "bucket": bucket,
+            "results_posted": results_posted,
+        })
+
+    _bucket_order = {"overdue": 0, "imminent": 1, "near": 2, "upcoming": 3, "reported": 4}
+    catalysts.sort(key=lambda c: (
+        _bucket_order.get(c["bucket"], 5),
+        c["days_until_readout"] if c["days_until_readout"] is not None else 9999,
+    ))
+    return catalysts
+
+
+async def fetch_trial_catalysts(
+    pathway: str = "",
+    drug: str = "",
+    sponsor: str = "",
+) -> list[dict]:
+    """
+    Orchestrate BrightData discovery → API v2 enrichment → derive_catalysts.
+
+    Discovery: if BRIGHTDATA_BROWSER_AUTH is set, use the Scraping Browser to
+    get NCT IDs from the rendered ClinicalTrials.gov search page.
+    Fallback: if no auth or no results, query the API v2 directly.
+
+    Returns a list of catalyst dicts (sorted overdue → imminent → near → upcoming → reported).
+    Never raises — returns [] on complete failure.
+    """
+    if not pathway and not drug and not sponsor:
+        return []
+
+    nct_ids: list[str] = []
+    has_brightdata = bool(os.getenv("BRIGHTDATA_BROWSER_AUTH"))
+
+    if has_brightdata:
+        try:
+            bd_records = await fetch_clinicaltrials_brightdata(
+                pathway, drug=drug, sponsor=sponsor, max_results=50
+            )
+            nct_ids = [r["nct_id"] for r in bd_records if r.get("nct_id")]
+            log.info("Catalyst Calendar: BrightData discovered %d NCT IDs", len(nct_ids))
+        except Exception as e:
+            log.warning("Catalyst Calendar: BrightData discovery failed (%s) — falling back", e)
+
+    if not nct_ids:
+        log.info("Catalyst Calendar: using API v2 query fallback")
+        try:
+            params: dict[str, Any] = {
+                "fields": _CT_FIELDS,
+                "filter.overallStatus": (
+                    "RECRUITING,ACTIVE_NOT_RECRUITING,ENROLLING_BY_INVITATION"
+                ),
+                "pageSize": 50,
+                "format": "json",
+            }
+            if pathway:
+                params["query.term"] = pathway
+            if drug:
+                params["query.intr"] = drug
+            if sponsor:
+                params["query.spons"] = sponsor
+            data = _ct_api_get(params)
+            nct_ids = [
+                study.get("protocolSection", {}).get("identificationModule", {}).get("nctId", "")
+                for study in data.get("studies", [])
+            ]
+            nct_ids = [n for n in nct_ids if n]
+            log.info("Catalyst Calendar: API v2 fallback found %d NCT IDs", len(nct_ids))
+        except Exception as e:
+            log.warning("Catalyst Calendar: API v2 fallback failed (%s) — returning []", e)
+            return []
+
+    enriched = enrich_trials_via_api(nct_ids)
+    catalysts = derive_catalysts(enriched)
+    log.info("Catalyst Calendar: %d catalyst records derived", len(catalysts))
+    return catalysts
+
+
+# ── 7. Conference Abstracts via BrightData Scraping Browser ──────────────────
+# ACR  (acrabstracts.org)  — Green:  open robots.txt; search is server-rendered HTML;
+#                                     BrightData adds bot-evasion resilience.
+# ASCO (meetings.asco.org) — Red:    Flutter SPA; non-profit — BrightData may classify
+#                                     as NGO; proxy_error is caught and returns [].
+#
+# Both return [] gracefully on any failure.
+# Records (source, title, abstract, url, year) flow into the Synthesizer triage as
+# plain text — no changes to ai_orchestrator.py are required.
+
+_CONF_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+}
+
+
+async def _scrape_acr(
+    pathway: str,
+    drug: str = "",
+    max_pages: int = 3,
+) -> list[dict]:
+    """
+    Scrape ACR (American College of Rheumatology) abstracts from acrabstracts.org.
+    acrabstracts.org robots.txt is fully open (Disallow: nothing).
+    Search results load as server-rendered HTML; BrightData provides bot evasion
+    and renders any lazy-loaded pagination JS.
+
+    Up to max_pages of search results are collected; each unique abstract slug is
+    then visited for the full title + body text.
+    """
+    auth = os.getenv("BRIGHTDATA_BROWSER_AUTH")
+    if not auth:
+        return []
+
+    import urllib.parse
+    from playwright.async_api import async_playwright
+
+    query = urllib.parse.quote(" ".join(p for p in [pathway, drug] if p))
+    ws_url = f"wss://{auth}@brd.superproxy.io:9222"
+    current_year = str(date.today().year)
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+
+    try:
+        async with async_playwright() as p:
+            log.info("ACR: connecting to BrightData Scraping Browser...")
+            browser = await asyncio.wait_for(
+                p.chromium.connect_over_cdp(ws_url), timeout=60
+            )
+            log.info("ACR: connected, starting search...")
+            page = await browser.new_page()
+
+            for page_num in range(1, max_pages + 1):
+                search_url = (
+                    f"https://acrabstracts.org/?s={query}"
+                    if page_num == 1
+                    else f"https://acrabstracts.org/page/{page_num}/?s={query}"
+                )
+                try:
+                    await page.goto(search_url, wait_until="domcontentloaded", timeout=60_000)
+                    log.info("ACR: search page %d loaded", page_num)
+                except Exception as e:
+                    log.warning("ACR: search page %d failed (%s)", page_num, e)
+                    break
+
+                links: list[str] = await page.evaluate("""
+                    () => [...new Set(
+                        Array.from(document.querySelectorAll('a[href*="/abstract/"]'))
+                            .map(a => a.href)
+                            .filter(h => h.includes('acrabstracts.org/abstract/'))
+                    )]
+                """) or []
+                log.info("ACR: found %d abstract links on page %d", len(links), page_num)
+
+                new_links = [l for l in links if l not in seen_urls]
+                if not new_links:
+                    break
+                seen_urls.update(new_links)
+
+                for abs_url in new_links[:20]:
+                    try:
+                        await page.goto(abs_url, wait_until="domcontentloaded", timeout=40_000)
+                        data = await page.evaluate("""
+                            () => {
+                                const titleEl = (
+                                    document.querySelector('.entry-title') ||
+                                    document.querySelector('h1')           ||
+                                    document.querySelector('h2')
+                                );
+                                const title = titleEl ? titleEl.textContent.trim() : '';
+                                const bodyEl = (
+                                    document.querySelector('.entry-content')    ||
+                                    document.querySelector('.abstract-content') ||
+                                    document.querySelector('article .content')  ||
+                                    document.querySelector('.abstract')
+                                );
+                                const body = bodyEl ? bodyEl.textContent.trim() : '';
+                                const yearM = (document.title + document.body.textContent)
+                                                .match(/20\\d{2}/);
+                                return { title, body, year: yearM ? yearM[0] : '' };
+                            }
+                        """)
+                        title    = (data.get("title") or "").strip()
+                        abstract = (data.get("body")  or "").strip()
+                        rec_year = (data.get("year")  or current_year).strip()[:4]
+                        if title and abstract:
+                            results.append({
+                                "source": "acr",
+                                "source_label": f"ACR {rec_year}",
+                                "title": title,
+                                "abstract": abstract[:3000],
+                                "url": abs_url,
+                                "year": rec_year,
+                            })
+                    except Exception as e:
+                        log.debug("ACR: skipping %s (%s)", abs_url, e)
+
+            await browser.close()
+
+    except asyncio.TimeoutError:
+        log.warning("ACR: BrightData connection timed out")
+    except Exception as e:
+        log.warning("ACR scrape failed (%s: %s) — returning %d collected", type(e).__name__, e, len(results))
+
+    log.info("ACR: scraped %d abstracts for '%s'", len(results), pathway)
+    return results
+
+
+
+async def _scrape_asco(
+    pathway: str,
+    drug: str = "",
+    year: Optional[int] = None,
+) -> list[dict]:
+    """
+    Scrape ASCO (American Society of Clinical Oncology) abstracts from
+    meetings.asco.org, a Flutter SPA that requires BrightData for JS rendering.
+
+    ASCO is a non-profit and may be classified as an NGO by BrightData, which
+    blocks such sites by default. A proxy_error is caught and returns [] with an
+    informative log message. To unlock: submit KYC at brightdata.com compliance.
+    """
+    auth = os.getenv("BRIGHTDATA_BROWSER_AUTH")
+    if not auth:
+        return []
+
+    from playwright.async_api import async_playwright
+
+    ws_url   = f"wss://{auth}@brd.superproxy.io:9222"
+    query    = " ".join(p for p in [pathway, drug] if p)
+    rec_year = str(year or date.today().year)
+    results: list[dict] = []
+
+    try:
+        async with async_playwright() as p:
+            log.info("ASCO: connecting to BrightData Scraping Browser...")
+            browser = await asyncio.wait_for(
+                p.chromium.connect_over_cdp(ws_url), timeout=30
+            )
+            page = await browser.new_page()
+
+            await page.goto(
+                "https://meetings.asco.org/abstracts-presentations/search",
+                wait_until="networkidle",
+                timeout=60_000,
+            )
+            await page.wait_for_timeout(3000)  # Flutter needs extra settle time
+
+            # Locate search input in the Flutter DOM
+            search_input = None
+            for sel in [
+                'input[type="search"]',
+                'input[placeholder*="earch"]',
+                'input[aria-label*="earch"]',
+                '[role="searchbox"]',
+                'input[type="text"]',
+            ]:
+                try:
+                    el = await page.wait_for_selector(sel, timeout=4000)
+                    if el:
+                        search_input = el
+                        break
+                except Exception:
+                    continue
+
+            if not search_input:
+                log.warning("ASCO: search input not found after render — returning []")
+                await browser.close()
+                return []
+
+            await search_input.fill(query)
+            await search_input.press("Enter")
+            await page.wait_for_timeout(4000)
+
+            abstracts = await page.evaluate("""
+                () => {
+                    const cards = document.querySelectorAll(
+                        '[class*="abstract-card"], [class*="result-item"], ' +
+                        '[class*="search-result"], article, [role="article"]'
+                    );
+                    return Array.from(cards).map(card => {
+                        const titleEl = card.querySelector('h2, h3, [class*="title"]');
+                        const bodyEl  = card.querySelector('p, [class*="body"], [class*="abstract"]');
+                        const linkEl  = card.querySelector('a[href]');
+                        return {
+                            title: titleEl ? titleEl.textContent.trim() : '',
+                            body:  bodyEl  ? bodyEl.textContent.trim()  : '',
+                            href:  linkEl  ? linkEl.href : '',
+                        };
+                    }).filter(c => c.title);
+                }
+            """) or []
+
+            await browser.close()
+
+            for card in abstracts[:40]:
+                title    = (card.get("title") or "").strip()
+                abstract = (card.get("body")  or "").strip()
+                url      = card.get("href") or "https://meetings.asco.org/abstracts-presentations/search"
+                if title:
+                    results.append({
+                        "source": "asco",
+                        "source_label": f"ASCO {rec_year}",
+                        "title": title,
+                        "abstract": abstract[:3000],
+                        "url": url,
+                        "year": rec_year,
+                    })
+
+    except asyncio.TimeoutError:
+        log.warning("ASCO: BrightData connection timed out")
+    except Exception as e:
+        err = str(e)
+        if "proxy_error" in err or "Access denied" in err or "classified as" in err:
+            log.warning(
+                "ASCO: blocked by BrightData (NGO classification) — returning []. "
+                "To unlock, submit KYC at https://brightdata.com/acceptable-use-policy"
+            )
+        else:
+            log.warning("ASCO scrape failed (%s: %s) — returning []", type(e).__name__, e)
+
+    log.info("ASCO: scraped %d abstracts for '%s'", len(results), query)
+    return results
+
+
+async def fetch_conference_abstracts(
+    pathway: str = "",
+    drug: str = "",
+    conferences: Optional[List[str]] = None,
+) -> list[dict]:
+    """
+    Orchestrate BrightData conference abstract scraping for the given conference list.
+    conferences: subset of ["acr", "asco"] — only listed ones run.
+
+    Scrapers run concurrently; each failure is logged and returns [] without
+    blocking the others. Returns [] immediately if BRIGHTDATA_BROWSER_AUTH is unset.
+    """
+    if not os.getenv("BRIGHTDATA_BROWSER_AUTH"):
+        log.info("BRIGHTDATA_BROWSER_AUTH not set — conference abstract agent returning []")
+        return []
+
+    enabled = set(conferences or [])
+    if not enabled:
+        return []
+
+    scraper_map = {
+        "acr":  lambda: _scrape_acr(pathway, drug),
+        "asco": lambda: _scrape_asco(pathway, drug),
+    }
+    active = [(k, scraper_map[k]) for k in ("acr", "asco") if k in enabled]
+    if not active:
+        return []
+
+    gathered = await asyncio.gather(
+        *[fn() for _, fn in active],
+        return_exceptions=True,
+    )
+
+    all_records: list[dict] = []
+    for (conf, _), result in zip(active, gathered):
+        if isinstance(result, Exception):
+            log.warning("Conference scraper '%s' raised unexpectedly: %s", conf, result)
+        elif isinstance(result, list):
+            all_records.extend(result)
+
+    log.info("Conference abstracts total: %d records from %s", len(all_records), list(enabled))
+    return all_records
+
+
+# ── 6. ChemRxiv (stretch goal — preclinical pharmacology) ────────────────────
 
 def fetch_chemrxiv(days_back: int = 7) -> list[dict]:
     """
@@ -408,29 +1096,54 @@ async def ingest_all(
     twitter_handles: Optional[List[str]] = None,
     days_back: int = 3,
     include_chemrxiv: bool = False,
+    include_clinicaltrials: bool = False,
+    drug: str = "",
+    sponsor: str = "",
+    conference_list: Optional[List[str]] = None,
 ) -> list[dict]:
     """
-    Run all ingestion agents and return a unified list of records.
+    Run all ingestion agents and return a unified list of text records.
     Each record has at minimum: source, title/text, abstract/body.
+
+    include_clinicaltrials — scrape ClinicalTrials.gov text records via BrightData.
+    conference_list        — list of conference keys to scrape, e.g. ["acr", "asco"].
+                             Silently no-ops if BRIGHTDATA_BROWSER_AUTH is not set.
+    drug / sponsor         — optional filters threaded into ClinicalTrials searches.
+
+    NOTE: Catalyst Calendar structured records (dates, readout windows) come from
+    fetch_trial_catalysts(), called separately in app.py as cached_catalysts().
     """
     subreddits = reddit_subreddits or ["biotech", "investing", "stocks"]
 
     loop = asyncio.get_event_loop()
 
-    # Reddit tasks are async (Playwright) — run sequentially to avoid competing
-    # for the same Bright Data browser session; parallel sessions cost extra bandwidth
     reddit_tasks = [extract_reddit_playwright(sub, 50) for sub in subreddits]
     preprint_task = fetch_all_preprints(days_back)
     twitter_task = loop.run_in_executor(
         None, fetch_x_kol_grok, twitter_handles or [], pathway_hint, days_back
     )
 
-    reddit_results, preprint_results, twitter_results = await asyncio.gather(
+    has_brightdata = bool(os.getenv("BRIGHTDATA_BROWSER_AUTH"))
+
+    run_ct = include_clinicaltrials and has_brightdata and bool(pathway_hint or drug)
+    if run_ct:
+        ct_task: asyncio.Future = asyncio.ensure_future(
+            fetch_clinicaltrials_brightdata(pathway_hint, drug=drug, sponsor=sponsor)
+        )
+
+    run_conf = bool(conference_list) and has_brightdata
+    if run_conf:
+        conf_task: asyncio.Future = asyncio.ensure_future(
+            fetch_conference_abstracts(pathway_hint, drug=drug, conferences=conference_list)
+        )
+
+    gather_results = await asyncio.gather(
         asyncio.gather(*reddit_tasks, return_exceptions=True),
         preprint_task,
         twitter_task,
         return_exceptions=False,
     )
+    reddit_results, preprint_results, twitter_results = gather_results
 
     all_records: list[dict] = []
     for result in reddit_results:
@@ -439,6 +1152,14 @@ async def ingest_all(
 
     all_records.extend(preprint_results)
     all_records.extend(twitter_results)
+
+    if run_ct:
+        ct_records = await ct_task
+        all_records.extend(ct_records)
+
+    if run_conf:
+        conf_records = await conf_task
+        all_records.extend(conf_records)
 
     if include_chemrxiv:
         chemrxiv_results = await loop.run_in_executor(None, fetch_chemrxiv, days_back)
