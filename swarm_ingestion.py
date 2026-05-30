@@ -17,10 +17,11 @@ from datetime import date, timedelta
 from typing import Any, List, Optional
 
 import requests
-from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-load_dotenv()
+from secrets_loader import load_secrets
+
+load_secrets()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)

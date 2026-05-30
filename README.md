@@ -128,6 +128,27 @@ Open [http://localhost:8501](http://localhost:8501).
 
 ---
 
+## Deploy for Hackathon Judges (Streamlit Community Cloud)
+
+PathwayPulse is ready to deploy on **[Streamlit Community Cloud](https://share.streamlit.io)** — free, public URL, no server management.
+
+**Quick steps:**
+
+1. Push this repo to GitHub (`artao05/PathwayPulse`)
+2. Go to [share.streamlit.io](https://share.streamlit.io) → **New app** → select repo, branch `main`, main file `app.py`
+3. **Settings → Secrets** — paste keys from [`.streamlit/secrets.toml.example`](.streamlit/secrets.toml.example):
+   - Required: `OPENAI_API_KEY`, `AIMLAPI_KEY`
+   - Optional: `XAI_API_KEY`, `BRIGHTDATA_BROWSER_AUTH`
+4. Share the public URL with judges (e.g. `https://pathwaypulse.streamlit.app`)
+
+Full instructions: **[DEPLOY.md](DEPLOY.md)**
+
+**What judges get without BrightData:** preprints, Reddit, Catalyst Calendar (API v2), AI synthesis, node graph, and intelligence report (~2–4 min per run).
+
+**With BrightData secret:** ACR conference abstracts also enabled (~4–5 min per run).
+
+---
+
 ## How BrightData Is Used
 
 BrightData's **Scraping Browser** (Playwright over CDP WebSocket) is used for two targets that require JavaScript rendering and bot-evasion:

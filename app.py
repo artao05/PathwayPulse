@@ -6,7 +6,10 @@ import asyncio
 import os
 
 import streamlit as st
-from dotenv import load_dotenv
+from secrets_loader import load_secrets
+
+load_secrets()
+
 from streamlit_flow import streamlit_flow
 from streamlit_flow.elements import StreamlitFlowEdge, StreamlitFlowNode
 from streamlit_flow.layouts import TreeLayout
@@ -14,8 +17,6 @@ from streamlit_flow.state import StreamlitFlowState
 
 from ai_orchestrator import CrossPollinationEvent, run_pipeline
 from swarm_ingestion import fetch_conference_abstracts, fetch_trial_catalysts, ingest_all
-
-load_dotenv()
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -67,7 +68,7 @@ def cached_ingest(
     include_clinicaltrials: bool,
     drug: str,
     sponsor: str,
-    conference_list: tuple,      # tuple for hashability ("acr", "ash", "asco")
+    conference_list: tuple,      # tuple for hashability ("acr", "asco")
     kol_handles: tuple,          # tuple (not list) so @st.cache_data can hash it
     reddit_subs: tuple,          # tuple for hashability
 ) -> list[dict]:
@@ -256,9 +257,9 @@ with st.sidebar:
         disabled=not _has_brightdata,
         help=(
             "Scrapes active/recruiting trials matching your pathway via "
-            "Bright Data Scraping Browser. Requires BRIGHTDATA_BROWSER_AUTH in .env."
+            "Bright Data Scraping Browser. Requires BRIGHTDATA_BROWSER_AUTH in secrets."
             if _has_brightdata
-            else "Set BRIGHTDATA_BROWSER_AUTH in .env to enable ClinicalTrials.gov scraping."
+            else "Set BRIGHTDATA_BROWSER_AUTH in Streamlit secrets or .env to enable."
         ),
     )
     if include_clinicaltrials and not _has_brightdata:
@@ -294,7 +295,7 @@ with st.sidebar:
         )
     else:
         st.caption(
-            "Conference abstracts disabled — set BRIGHTDATA_BROWSER_AUTH in .env to enable."
+            "Conference abstracts disabled — set BRIGHTDATA_BROWSER_AUTH in Streamlit secrets or .env."
         )
         _conf_selected = []
 
@@ -392,6 +393,17 @@ st.markdown(
     'detecting cross-indication repurposing signals in real time</p>',
     unsafe_allow_html=True,
 )
+
+if not (os.getenv("OPENAI_API_KEY") and os.getenv("AIMLAPI_KEY")):
+    st.error(
+        "Missing API keys. Add `OPENAI_API_KEY` and `AIMLAPI_KEY` in "
+        "**Settings → Secrets** (Streamlit Cloud) or `.env` (local)."
+    )
+elif "pipeline_results" not in st.session_state:
+    st.info(
+        "Click **Run Analysis** in the sidebar to generate the Arbitrage Matrix. "
+        "First run takes ~2–4 minutes; results are cached for 1 hour."
+    )
 
 # ── Run pipeline on button press ─────────────────────────────────────────────
 

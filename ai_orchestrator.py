@@ -17,10 +17,11 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import load_dotenv
 from pydantic import BaseModel, Field, ValidationError
 
-load_dotenv()
+from secrets_loader import load_secrets
+
+load_secrets()
 
 log = logging.getLogger(__name__)
 ERROR_LOG = Path("errors.log")
