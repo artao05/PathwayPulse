@@ -6,7 +6,7 @@ import asyncio
 import os
 
 import streamlit as st
-from secrets_loader import load_secrets
+from secrets_loader import api_key_status, load_secrets, required_keys_ok
 
 load_secrets()
 
@@ -247,6 +247,23 @@ with st.sidebar:
     sponsor = sponsor_input.strip()
 
     st.markdown("**Data Sources**")
+    _key_status = api_key_status()
+    with st.expander("API key status", expanded=not required_keys_ok()):
+        st.caption("Required for Run Analysis")
+        st.write(f"{'✅' if _key_status['OPENAI_API_KEY'] else '❌'} OPENAI_API_KEY")
+        st.write(f"{'✅' if _key_status['AIMLAPI_KEY'] else '❌'} AIMLAPI_KEY")
+        st.caption("Optional")
+        st.write(f"{'✅' if _key_status['XAI_API_KEY'] else '—'} XAI_API_KEY (Twitter/KOL)")
+        st.write(
+            f"{'✅' if _key_status['BRIGHTDATA_BROWSER_AUTH'] else '—'} "
+            "BRIGHTDATA_BROWSER_AUTH (ACR abstracts)"
+        )
+        if not required_keys_ok():
+            st.warning(
+                "Add missing keys in **Manage app → Settings → Secrets** using TOML format. "
+                "See `.streamlit/secrets.toml.example` in the repo."
+            )
+
     days_back = st.slider("Days of preprint history", min_value=1, max_value=14, value=3)
     include_chemrxiv = st.checkbox("Include ChemRxiv (preclinical)", value=False)
 
@@ -295,7 +312,7 @@ with st.sidebar:
         )
     else:
         st.caption(
-            "Conference abstracts disabled — set BRIGHTDATA_BROWSER_AUTH in Streamlit secrets or .env."
+            "Optional: add BRIGHTDATA_BROWSER_AUTH in Secrets to enable ACR conference abstracts."
         )
         _conf_selected = []
 
@@ -394,10 +411,11 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-if not (os.getenv("OPENAI_API_KEY") and os.getenv("AIMLAPI_KEY")):
+if not required_keys_ok():
     st.error(
         "Missing API keys. Add `OPENAI_API_KEY` and `AIMLAPI_KEY` in "
-        "**Settings → Secrets** (Streamlit Cloud) or `.env` (local)."
+        "**Manage app → Settings → Secrets** (Streamlit Cloud) or `.env` (local). "
+        "Use TOML format with quotes — see `.streamlit/secrets.toml.example`."
     )
 elif "pipeline_results" not in st.session_state:
     st.info(
