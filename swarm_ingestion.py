@@ -3,10 +3,12 @@ PathwayPulse — Ingestion Swarm
 Agents feed raw text into the AI orchestrator:
   1. extract_reddit_alpha          — biotech community signal via public Atom RSS feed
   2. fetch_preprints               — bioRxiv + medRxiv clinical preprints (shared paginator)
-  3. fetch_x_kol_grok              — KOL tweets via Grok xAI x_search tool (optional)
-  4. fetch_clinicaltrials_api       — ClinicalTrials.gov via free API v2 (no auth)
-  5. fetch_trial_catalysts         — Catalyst Calendar: API v2 discovery + enrichment
-  6. fetch_chemrxiv                — preclinical pharmacology (stretch goal)
+  3. fetch_pubmed_literature       — peer-reviewed abstracts via NCBI E-utilities
+  4. annotate_openalex_citations   — citation counts / journal locations for preprints
+  5. fetch_x_kol_grok              — KOL tweets via Grok xAI x_search tool (optional)
+  6. fetch_clinicaltrials_api       — ClinicalTrials.gov via free API v2 (no auth)
+  7. fetch_trial_catalysts         — Catalyst Calendar: API v2 discovery + enrichment
+  8. fetch_chemrxiv                — preclinical pharmacology (stretch goal)
 """
 from __future__ import annotations
 
@@ -29,17 +31,30 @@ log = logging.getLogger(__name__)
 _BIORXIV_BASE = "https://api.biorxiv.org/details/{server}/{start}/{end}/{cursor}"
 _CHEMRXIV_BASE = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
 _CT_API_BASE = "https://clinicaltrials.gov/api/v2/studies"
+_NCBI_EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+_OPENALEX_BASE = "https://api.openalex.org"
 _CT_FIELDS = (
     "NCTId,BriefTitle,OverallStatus,StartDateStruct,PrimaryCompletionDateStruct,"
     "CompletionDateStruct,ResultsFirstPostDateStruct,Phase,LeadSponsorName,"
     "InterventionName,Condition"
 )
 _MAX_RECORDS_PER_SERVER = 300
+_MAX_PUBMED_RECORDS = 50
+_OPENALEX_CHUNK_SIZE = 50
 
 _PREPRINT_URL_BASES = {
     "biorxiv": "https://www.biorxiv.org",
     "medrxiv": "https://www.medrxiv.org",
 }
+_OPENALEX_PREPRINT_SOURCES = {"biorxiv", "medrxiv", "chemrxiv"}
+_PREPRINT_SOURCE_NAME_FRAGMENTS = ("biorxiv", "medrxiv", "chemrxiv")
+_ENV_PLACEHOLDER_TOKENS = (
+    "...",
+    "replace-with",
+    "sk-replace-with",
+    "brd-customer-xxxx",
+    "you@example.com",
+)
 
 
 def _preprint_url(server: str, doi: str) -> str:
@@ -58,9 +73,19 @@ def _source_label(record: dict) -> str:
         return f"@{handle}" if handle else "X/Twitter"
     if src in ("biorxiv", "medrxiv"):
         return src.replace("biorxiv", "bioRxiv").replace("medrxiv", "medRxiv")
+    if src == "pubmed":
+        return "PubMed"
     if src == "chemrxiv":
         return "ChemRxiv"
     return src
+
+
+def _configured_env(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    normalized = value.lower()
+    if not value or any(token in normalized for token in _ENV_PLACEHOLDER_TOKENS):
+        return ""
+    return value
 
 
 # ── 1. Reddit RSS Feed (no auth, no PRAW, no Bright Data) ────────────────────
@@ -221,6 +246,304 @@ async def fetch_all_preprints(days_back: int = 3) -> list[dict]:
             combined.extend(result)
     log.info("Preprints total: %d records", len(combined))
     return combined
+
+
+# ── 2B. PubMed peer-reviewed literature (NCBI E-utilities) ───────────────────
+
+def _ncbi_env_params() -> dict[str, str]:
+    """Return optional NCBI request parameters without exposing secrets."""
+    params = {"tool": os.getenv("NCBI_TOOL", "PathwayPulse")}
+    email = _configured_env("USER_EMAIL")
+    api_key = _configured_env("NCBI_API_KEY")
+    if email:
+        params["email"] = email
+    if api_key:
+        params["api_key"] = api_key
+    return params
+
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _ncbi_get(endpoint: str, params: dict[str, Any], *, raw: bool = False) -> Any:
+    resp = requests.get(
+        f"{_NCBI_EUTILS_BASE}/{endpoint}",
+        params={**_ncbi_env_params(), **params},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.text if raw else resp.json()
+
+
+def _xml_text(element: Optional[_ET.Element]) -> str:
+    if element is None:
+        return ""
+    return " ".join("".join(element.itertext()).split())
+
+
+def _pubmed_date(article: _ET.Element) -> str:
+    pub_date = article.find(".//Journal/JournalIssue/PubDate")
+    if pub_date is None:
+        return ""
+    year = pub_date.findtext("Year") or ""
+    month = pub_date.findtext("Month") or ""
+    day = pub_date.findtext("Day") or ""
+    medline = pub_date.findtext("MedlineDate") or ""
+    return " ".join(p for p in (year, month, day) if p).strip() or medline
+
+
+def _pubmed_abstract(article: _ET.Element) -> str:
+    parts: list[str] = []
+    for abstract_text in article.findall(".//Abstract/AbstractText"):
+        label = abstract_text.get("Label", "").strip()
+        text = _xml_text(abstract_text)
+        if not text:
+            continue
+        parts.append(f"{label}: {text}" if label else text)
+    return "\n".join(parts)
+
+
+def fetch_pubmed_literature(
+    pathway: str,
+    days_back: int = 30,
+    max_results: int = _MAX_PUBMED_RECORDS,
+) -> list[dict]:
+    """
+    Fetch recent peer-reviewed literature from PubMed via NCBI E-utilities.
+
+    Returns records shaped for the Synthesizer:
+    {source, pmid, doi, url, source_label, title, abstract, journal, date}
+    Returns [] on any failure so the pipeline continues unaffected.
+    """
+    pathway = pathway.strip()
+    if not pathway:
+        return []
+
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days_back)
+    date_filter = f"{start_date:%Y/%m/%d}:{end_date:%Y/%m/%d}[dp]"
+    query = f"({pathway}) AND ({date_filter})"
+
+    try:
+        search_data = _ncbi_get(
+            "esearch.fcgi",
+            {
+                "db": "pubmed",
+                "term": query,
+                "retmax": min(max_results, _MAX_PUBMED_RECORDS),
+                "sort": "pub_date",
+                "retmode": "json",
+            },
+        )
+        pmids = search_data.get("esearchresult", {}).get("idlist", [])
+        if not pmids:
+            log.info("PubMed: no records for '%s' (days_back=%d)", pathway, days_back)
+            return []
+
+        xml_data = _ncbi_get(
+            "efetch.fcgi",
+            {
+                "db": "pubmed",
+                "id": ",".join(pmids),
+                "rettype": "abstract",
+                "retmode": "xml",
+            },
+            raw=True,
+        )
+        root = _ET.fromstring(xml_data)
+    except Exception as e:
+        log.warning("PubMed fetch failed (%s: %s) — returning []", type(e).__name__, e)
+        return []
+
+    records: list[dict] = []
+    for pubmed_article in root.iter("PubmedArticle"):
+        medline = pubmed_article.find(".//MedlineCitation")
+        article = pubmed_article.find(".//Article")
+        if article is None:
+            continue
+
+        pmid = _xml_text(pubmed_article.find(".//PMID"))
+        title = _xml_text(article.find("ArticleTitle"))
+        abstract = _pubmed_abstract(article)
+        if not (pmid and title and abstract):
+            continue
+
+        doi = ""
+        for article_id in pubmed_article.findall(".//ArticleIdList/ArticleId"):
+            if article_id.get("IdType") == "doi" and article_id.text:
+                doi = article_id.text.strip()
+                break
+        if not doi:
+            for eid in article.findall("ELocationID"):
+                if eid.get("EIdType") == "doi" and eid.text:
+                    doi = eid.text.strip()
+                    break
+
+        authors: list[str] = []
+        for author in article.findall(".//AuthorList/Author")[:6]:
+            last = author.findtext("LastName") or ""
+            initials = author.findtext("Initials") or ""
+            collective = author.findtext("CollectiveName") or ""
+            name = f"{last} {initials}".strip() if last else collective.strip()
+            if name:
+                authors.append(name)
+
+        records.append({
+            "source": "pubmed",
+            "pmid": pmid,
+            "doi": doi,
+            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+            "source_label": "PubMed",
+            "title": title,
+            "abstract": abstract[:3000],
+            "journal": _xml_text(article.find(".//Journal/Title")),
+            "date": _pubmed_date(medline if medline is not None else article),
+            "authors": authors,
+        })
+
+    log.info("PubMed: fetched %d abstracts for '%s'", len(records), pathway)
+    return records
+
+
+async def fetch_pubmed_literature_async(
+    pathway: str,
+    days_back: int = 30,
+    max_results: int = _MAX_PUBMED_RECORDS,
+) -> list[dict]:
+    """Async wrapper for PubMed ingestion."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None, fetch_pubmed_literature, pathway, days_back, max_results
+    )
+
+
+# ── 2C. OpenAlex citation enrichment for preprints ───────────────────────────
+
+def _openalex_params(params: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(params)
+    api_key = _configured_env("OPENALEX_API_KEY")
+    email = _configured_env("USER_EMAIL")
+    if api_key:
+        merged["api_key"] = api_key
+    elif email:
+        merged["mailto"] = email
+    return merged
+
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _openalex_get(path: str, params: dict[str, Any]) -> dict:
+    resp = requests.get(
+        f"{_OPENALEX_BASE}/{path.lstrip('/')}",
+        params=_openalex_params(params),
+        timeout=20,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _normalize_doi(doi: str) -> str:
+    doi = (doi or "").strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/", "doi:"):
+        if doi.startswith(prefix):
+            doi = doi[len(prefix):]
+    return doi.strip()
+
+
+def _preprint_source_name(source_name: str) -> bool:
+    normalized = source_name.lower()
+    return any(fragment in normalized for fragment in _PREPRINT_SOURCE_NAME_FRAGMENTS)
+
+
+def _journal_location(work: dict) -> dict:
+    locations: list[dict] = []
+    for key in ("primary_location", "best_oa_location"):
+        value = work.get(key)
+        if isinstance(value, dict):
+            locations.append(value)
+    locations.extend([loc for loc in work.get("locations", []) if isinstance(loc, dict)])
+
+    for location in locations:
+        source = location.get("source") or {}
+        source_name = source.get("display_name") or ""
+        source_type = source.get("type") or ""
+        if source_type == "journal" and not _preprint_source_name(source_name):
+            return {
+                "published_version_source": source_name,
+                "published_version_url": location.get("landing_page_url") or "",
+                "published_version_is_oa": bool(location.get("is_oa")),
+            }
+    return {}
+
+
+def _openalex_metadata(work: dict) -> dict:
+    metadata = {
+        "openalex_id": work.get("id", ""),
+        "openalex_url": work.get("id", ""),
+        "citation_count": int(work.get("cited_by_count") or 0),
+        "openalex_publication_year": work.get("publication_year"),
+        "openalex_publication_date": work.get("publication_date") or "",
+    }
+    metadata.update(_journal_location(work))
+    metadata["published_in_journal"] = bool(metadata.get("published_version_source"))
+    return metadata
+
+
+def annotate_openalex_citations(records: list[dict]) -> list[dict]:
+    """
+    Add OpenAlex citation metadata to DOI-bearing preprint records.
+
+    The function mutates and returns the input list. API failures are logged and
+    leave records unchanged.
+    """
+    doi_records = [
+        rec for rec in records
+        if rec.get("source") in _OPENALEX_PREPRINT_SOURCES and _normalize_doi(rec.get("doi", ""))
+    ]
+    if not doi_records:
+        return records
+
+    work_by_doi: dict[str, dict] = {}
+    try:
+        for i in range(0, len(doi_records), _OPENALEX_CHUNK_SIZE):
+            chunk = doi_records[i : i + _OPENALEX_CHUNK_SIZE]
+            doi_filter = "|".join(_normalize_doi(rec.get("doi", "")) for rec in chunk)
+            data = _openalex_get(
+                "works",
+                {
+                    "filter": f"doi:{doi_filter}",
+                    "per_page": len(chunk),
+                    "select": (
+                        "id,doi,display_name,cited_by_count,publication_year,"
+                        "publication_date,primary_location,best_oa_location,locations,type"
+                    ),
+                },
+            )
+            for work in data.get("results", []):
+                doi = _normalize_doi(work.get("doi", ""))
+                if doi:
+                    work_by_doi[doi] = work
+    except Exception as e:
+        log.warning("OpenAlex citation enrichment failed (%s: %s) — leaving records unchanged", type(e).__name__, e)
+        return records
+
+    enriched_count = 0
+    for rec in doi_records:
+        work = work_by_doi.get(_normalize_doi(rec.get("doi", "")))
+        if not work:
+            continue
+        rec.update(_openalex_metadata(work))
+        enriched_count += 1
+
+    log.info(
+        "OpenAlex: enriched %d / %d DOI-bearing preprints",
+        enriched_count,
+        len(doi_records),
+    )
+    return records
+
+
+async def annotate_openalex_citations_async(records: list[dict]) -> list[dict]:
+    """Async wrapper for OpenAlex citation enrichment."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, annotate_openalex_citations, records)
 
 
 # ── 3. X / Twitter KOL via Grok x_search ─────────────────────────────────────
@@ -1050,6 +1373,8 @@ async def ingest_all(
     reddit_subreddits: Optional[List[str]] = None,
     twitter_handles: Optional[List[str]] = None,
     days_back: int = 3,
+    include_pubmed: bool = False,
+    include_openalex: bool = False,
     include_chemrxiv: bool = False,
     include_clinicaltrials: bool = False,
     drug: str = "",
@@ -1060,6 +1385,8 @@ async def ingest_all(
     Run all ingestion agents and return a unified list of text records.
     Each record has at minimum: source, title/text, abstract/body.
 
+    include_pubmed         — fetch peer-reviewed PubMed abstracts via NCBI E-utilities.
+    include_openalex       — annotate DOI-bearing preprints with OpenAlex citation counts.
     include_clinicaltrials — fetch ClinicalTrials.gov text records via API v2
                              (no BrightData required).
     conference_list        — list of conference keys to scrape, e.g. ["acr", "asco"].
@@ -1078,6 +1405,13 @@ async def ingest_all(
     twitter_task = loop.run_in_executor(
         None, fetch_x_kol_grok, twitter_handles or [], pathway_hint, days_back
     )
+
+    # PubMed peer-reviewed literature via NCBI E-utilities
+    run_pubmed = include_pubmed and bool(pathway_hint)
+    if run_pubmed:
+        pubmed_task: asyncio.Future = asyncio.ensure_future(
+            fetch_pubmed_literature_async(pathway_hint, days_back=days_back)
+        )
 
     # ClinicalTrials.gov via API v2 — no BrightData required
     run_ct = include_clinicaltrials and bool(pathway_hint or drug)
@@ -1107,8 +1441,15 @@ async def ingest_all(
         if isinstance(result, list):
             all_records.extend(result)
 
+    if include_openalex:
+        preprint_results = await annotate_openalex_citations_async(preprint_results)
+
     all_records.extend(preprint_results)
     all_records.extend(twitter_results)
+
+    if run_pubmed:
+        pubmed_records = await pubmed_task
+        all_records.extend(pubmed_records)
 
     if run_ct:
         ct_records = await ct_task
@@ -1120,6 +1461,8 @@ async def ingest_all(
 
     if include_chemrxiv:
         chemrxiv_results = await loop.run_in_executor(None, fetch_chemrxiv, days_back)
+        if include_openalex:
+            chemrxiv_results = await annotate_openalex_citations_async(chemrxiv_results)
         all_records.extend(chemrxiv_results)
 
     log.info("Ingestion complete: %d total records", len(all_records))

@@ -10,7 +10,24 @@ KNOWN_KEYS = (
     "AIMLAPI_KEY",
     "XAI_API_KEY",
     "BRIGHTDATA_BROWSER_AUTH",
+    "NCBI_API_KEY",
+    "USER_EMAIL",
+    "OPENALEX_API_KEY",
 )
+PLACEHOLDER_TOKENS = (
+    "...",
+    "replace-with",
+    "sk-replace-with",
+    "brd-customer-xxxx",
+    "you@example.com",
+)
+
+
+def _looks_configured(value: str) -> bool:
+    normalized = value.strip().lower()
+    if not normalized:
+        return False
+    return not any(token in normalized for token in PLACEHOLDER_TOKENS)
 
 
 def _iter_secret_pairs(obj: Any, prefix: str = "") -> Iterator[tuple[str, str]]:
@@ -75,7 +92,7 @@ def load_secrets() -> None:
 def api_key_status() -> dict[str, bool]:
     """Return which API keys are present (never exposes values)."""
     load_secrets()
-    return {key: bool(os.getenv(key, "").strip()) for key in KNOWN_KEYS}
+    return {key: _looks_configured(os.getenv(key, "")) for key in KNOWN_KEYS}
 
 
 def required_keys_ok() -> bool:

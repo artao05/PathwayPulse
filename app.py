@@ -64,6 +64,8 @@ st.markdown(
 def cached_ingest(
     pathway: str,
     days_back: int,
+    include_pubmed: bool,
+    include_openalex: bool,
     include_chemrxiv: bool,
     include_clinicaltrials: bool,
     drug: str,
@@ -78,6 +80,8 @@ def cached_ingest(
             reddit_subreddits=list(reddit_subs),
             twitter_handles=list(kol_handles),
             days_back=days_back,
+            include_pubmed=include_pubmed,
+            include_openalex=include_openalex,
             include_chemrxiv=include_chemrxiv,
             include_clinicaltrials=include_clinicaltrials,
             drug=drug,
@@ -104,6 +108,8 @@ def cached_catalysts(
 def cached_pipeline(
     pathway: str,
     days_back: int,
+    include_pubmed: bool,
+    include_openalex: bool,
     include_chemrxiv: bool,
     include_clinicaltrials: bool,
     drug: str,
@@ -115,7 +121,8 @@ def cached_pipeline(
     model: str,
 ) -> tuple[list[dict], str]:
     records = cached_ingest(
-        pathway, days_back, include_chemrxiv, include_clinicaltrials,
+        pathway, days_back, include_pubmed, include_openalex,
+        include_chemrxiv, include_clinicaltrials,
         drug, sponsor, conference_list, kol_handles, reddit_subs,
     )
     cats = cached_catalysts(pathway, drug, sponsor, include_catalysts)
@@ -253,6 +260,9 @@ with st.sidebar:
         st.write(f"{'✅' if _key_status['OPENAI_API_KEY'] else '❌'} OPENAI_API_KEY")
         st.write(f"{'✅' if _key_status['AIMLAPI_KEY'] else '❌'} AIMLAPI_KEY")
         st.caption("Optional")
+        st.write(f"{'✅' if _key_status['NCBI_API_KEY'] else '—'} NCBI_API_KEY (PubMed rate limit)")
+        st.write(f"{'✅' if _key_status['USER_EMAIL'] else '—'} USER_EMAIL (NCBI/OpenAlex polite pool)")
+        st.write(f"{'✅' if _key_status['OPENALEX_API_KEY'] else '—'} OPENALEX_API_KEY (citations)")
         st.write(f"{'✅' if _key_status['XAI_API_KEY'] else '—'} XAI_API_KEY (Twitter/KOL)")
         st.write(
             f"{'✅' if _key_status['BRIGHTDATA_BROWSER_AUTH'] else '—'} "
@@ -264,7 +274,23 @@ with st.sidebar:
                 "See `.streamlit/secrets.toml.example` in the repo."
             )
 
-    days_back = st.slider("Days of preprint history", min_value=1, max_value=14, value=3)
+    days_back = st.slider("Days of source history", min_value=1, max_value=14, value=3)
+    include_pubmed = st.checkbox(
+        "Include PubMed (peer-reviewed)",
+        value=True,
+        help=(
+            "Fetches recent peer-reviewed abstracts for the pathway via "
+            "NCBI E-utilities. No API key required; NCBI_API_KEY is optional."
+        ),
+    )
+    include_openalex = st.checkbox(
+        "Enrich preprints with OpenAlex citations",
+        value=True,
+        help=(
+            "Adds citation counts and journal-location metadata to DOI-bearing "
+            "bioRxiv / medRxiv / ChemRxiv records. OPENALEX_API_KEY is optional."
+        ),
+    )
     include_chemrxiv = st.checkbox("Include ChemRxiv (preclinical)", value=False)
 
     _has_brightdata = bool(os.getenv("BRIGHTDATA_BROWSER_AUTH"))
@@ -431,6 +457,10 @@ if run_btn and pathway_input.strip():
             if len(reddit_subs) > 3:
                 sub_names += f" +{len(reddit_subs) - 3} more"
             ingest_label = f"Scraping bioRxiv, medRxiv, Reddit ({sub_names})"
+            if include_pubmed:
+                ingest_label += ", PubMed"
+            if include_openalex:
+                ingest_label += ", OpenAlex citations"
             if include_clinicaltrials:
                 ingest_label += ", ClinicalTrials.gov (API v2)"
             if conference_list:
@@ -442,7 +472,8 @@ if run_btn and pathway_input.strip():
             progress.progress(20, text=ingest_label)
 
             event_dicts, report = cached_pipeline(
-                pathway, days_back, include_chemrxiv, include_clinicaltrials,
+                pathway, days_back, include_pubmed, include_openalex,
+                include_chemrxiv, include_clinicaltrials,
                 drug, sponsor, include_catalysts, conference_list, kol_handles,
                 reddit_subs, model_choice,
             )
@@ -451,7 +482,8 @@ if run_btn and pathway_input.strip():
             events = [CrossPollinationEvent(**d) for d in event_dicts]
 
             _records = cached_ingest(
-                pathway, days_back, include_chemrxiv, include_clinicaltrials,
+                pathway, days_back, include_pubmed, include_openalex,
+                include_chemrxiv, include_clinicaltrials,
                 drug, sponsor, conference_list, kol_handles, reddit_subs,
             )
             _catalysts = cached_catalysts(pathway, drug, sponsor, include_catalysts)
@@ -571,6 +603,16 @@ if "pipeline_results" in st.session_state:
                 else:
                     badge = ev.source_label or ev.source_type or "unknown"
                     st.markdown(f"- Source: `{badge}`")
+                if ev.citation_count is not None:
+                    st.markdown(f"- OpenAlex citations: {ev.citation_count}")
+                if ev.published_version_source:
+                    if ev.published_version_url:
+                        st.markdown(
+                            f"- Published version: [{ev.published_version_source}]"
+                            f"({ev.published_version_url})"
+                        )
+                    else:
+                        st.markdown(f"- Published version: {ev.published_version_source}")
                 st.markdown(f"- Evidence: _{ev.source_evidence[:250]}_")
                 if i < len(events) - 1:
                     st.markdown("---")
@@ -678,7 +720,10 @@ if "pipeline_results" in st.session_state:
         for rec in raw_records:
             grouped[rec.get("source", "unknown")].append(rec)
 
-        source_order = ["biorxiv", "medrxiv", "chemrxiv", "clinicaltrials", "acr", "asco", "reddit", "twitter"]
+        source_order = [
+            "biorxiv", "medrxiv", "pubmed", "chemrxiv", "clinicaltrials",
+            "acr", "asco", "reddit", "twitter",
+        ]
         ordered_keys = [k for k in source_order if k in grouped] + [
             k for k in grouped if k not in source_order
         ]
@@ -688,7 +733,8 @@ if "pipeline_results" in st.session_state:
                 recs = grouped[src_key]
                 label_map = {
                     "biorxiv": "bioRxiv", "medrxiv": "medRxiv",
-                    "chemrxiv": "ChemRxiv", "clinicaltrials": "ClinicalTrials.gov",
+                    "pubmed": "PubMed", "chemrxiv": "ChemRxiv",
+                    "clinicaltrials": "ClinicalTrials.gov",
                     "acr": "ACR Abstracts", "asco": "ASCO Abstracts",
                     "reddit": "Reddit", "twitter": "X / Twitter",
                 }
@@ -702,6 +748,17 @@ if "pipeline_results" in st.session_state:
                         st.markdown(f"  - [{title[:80]}]({url})")
                     else:
                         st.markdown(f"  - {title[:80]}")
+                    meta_bits = []
+                    citation_count = rec.get("citation_count")
+                    if citation_count is not None:
+                        meta_bits.append(f"{citation_count} OpenAlex citations")
+                    published_source = rec.get("published_version_source")
+                    if published_source:
+                        meta_bits.append(f"published version: {published_source}")
+                    if rec.get("journal"):
+                        meta_bits.append(str(rec["journal"])[:80])
+                    if meta_bits:
+                        st.caption(" · ".join(meta_bits))
                 if len(recs) > 20:
                     st.caption(f"  … and {len(recs) - 20} more")
 
@@ -723,8 +780,8 @@ else:
     with how_col1:
         st.markdown(
             "**1. Ingest**\n\n"
-            "Simultaneously pulls from bioRxiv, medRxiv, and Reddit — "
-            "up to 600 preprints + community commentary per run."
+            "Simultaneously pulls from bioRxiv, medRxiv, PubMed, Reddit, "
+            "and optional clinical / conference sources."
         )
     with how_col2:
         st.markdown(
