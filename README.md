@@ -14,14 +14,13 @@ Built for the [Web Data UNLOCKED Hackathon](https://brightdata.com).
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Ingestion Swarm                          │
 │                                                                 │
-│  bioRxiv API ──────────────────────────────────────────────┐   │
-│  medRxiv API ──────────────────────────────────────────────┤   │
-│  Reddit RSS (5 subs) ──────────────────────────────────────┤   │
-│  ChemRxiv API (opt) ───────────────────────────────────────┤   │
-│  Grok xAI x_search (opt) ─────────────────────────────────┤   │
-│  BrightData Scraping Browser ─► ACR abstracts ────────────┤   │
-│  BrightData Scraping Browser ─► ClinicalTrials.gov ───────┤   │
-│    └─► CT API v2 enrichment (dates, phase, sponsor) ──────┘   │
+│  bioRxiv API ─────────────────────────────────────────────┐     │
+│  medRxiv API ─────────────────────────────────────────────┤     │
+│  Reddit RSS (5 subs) ─────────────────────────────────────┤     │
+│  ChemRxiv API (opt) ─────────────────────────────────────┤     │
+│  Grok xAI x_search (opt) ────────────────────────────────┤     │
+│  ClinicalTrials.gov API v2 ──────────────────────────────┤     │
+│  BrightData Scraping Browser ─► ACR abstracts ──────────────┘     │
 └──────────────────────────────┬──────────────────────────────────┘
                                │ up to 600 raw records
                                ▼
@@ -209,7 +208,7 @@ async with async_playwright() as p:
 | Reddit | Atom RSS feed | None | `reddit.com/r/{sub}/new.rss` — OAuth not required |
 | X / Twitter | Grok `x_search` tool (xAI API) | `XAI_API_KEY` | ~$0.005/run; enter handles in sidebar |
 | ChemRxiv | REST API (`chemrxiv.org`) | None | Pharmacology/biochemistry filter |
-| ClinicalTrials.gov (text) | BrightData Scraping Browser → API v2 fallback | `BRIGHTDATA_BROWSER_AUTH` | BrightData blocked by `.gov` policy; API v2 fallback activates automatically |
+| ClinicalTrials.gov (text) | REST API v2 (`clinicaltrials.gov/api/v2/studies`) | None | Free structured JSON; no BrightData or Playwright needed |
 | ClinicalTrials.gov (Catalyst Calendar) | CT API v2 | None | `startDateStruct`, `primaryCompletionDateStruct`, `ACTUAL` vs `ESTIMATED` type |
 | ACR Abstracts (`acrabstracts.org`) | BrightData Scraping Browser | `BRIGHTDATA_BROWSER_AUTH` | Green tier — open `robots.txt`. Up to 45 abstracts per run |
 | ASCO Abstracts (`meetings.asco.org`) | BrightData Scraping Browser | `BRIGHTDATA_BROWSER_AUTH` | Red tier — ASCO is a non-profit; BrightData may apply NGO classification. Returns `[]` gracefully if blocked. Submit KYC at brightdata.com to unlock |

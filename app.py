@@ -94,10 +94,10 @@ def cached_catalysts(
     sponsor: str,
     include_catalysts: bool,
 ) -> list[dict]:
-    """Fetch Catalyst Calendar records via BrightData + API v2 enrichment."""
+    """Fetch Catalyst Calendar records via ClinicalTrials.gov API v2."""
     if not include_catalysts:
         return []
-    return asyncio.run(fetch_trial_catalysts(pathway=pathway, drug=drug, sponsor=sponsor))
+    return fetch_trial_catalysts(pathway=pathway, drug=drug, sponsor=sponsor)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -270,25 +270,20 @@ with st.sidebar:
     _has_brightdata = bool(os.getenv("BRIGHTDATA_BROWSER_AUTH"))
     include_clinicaltrials = st.checkbox(
         "Include ClinicalTrials.gov text records",
-        value=_has_brightdata,
-        disabled=not _has_brightdata,
+        value=True,
         help=(
-            "Scrapes active/recruiting trials matching your pathway via "
-            "Bright Data Scraping Browser. Requires BRIGHTDATA_BROWSER_AUTH in secrets."
-            if _has_brightdata
-            else "Set BRIGHTDATA_BROWSER_AUTH in Streamlit secrets or .env to enable."
+            "Fetches active/recruiting trials matching your pathway via "
+            "the free ClinicalTrials.gov API v2. No API key required."
         ),
     )
-    if include_clinicaltrials and not _has_brightdata:
-        include_clinicaltrials = False
 
     include_catalysts = st.checkbox(
         "Show Catalyst Calendar",
         value=True,
         help=(
             "Surfaces upcoming / overdue trial readouts with start date, expected "
-            "primary-completion date, and days-until-readout. Uses BrightData for "
-            "discovery when available, otherwise queries ClinicalTrials.gov API v2 directly."
+            "primary-completion date, and days-until-readout. "
+            "Uses the free ClinicalTrials.gov API v2 — no API key required."
         ),
     )
 
@@ -437,7 +432,7 @@ if run_btn and pathway_input.strip():
                 sub_names += f" +{len(reddit_subs) - 3} more"
             ingest_label = f"Scraping bioRxiv, medRxiv, Reddit ({sub_names})"
             if include_clinicaltrials:
-                ingest_label += ", ClinicalTrials.gov"
+                ingest_label += ", ClinicalTrials.gov (API v2)"
             if conference_list:
                 conf_names = ", ".join(c.upper() for c in conference_list)
                 ingest_label += f", {conf_names} abstracts"
