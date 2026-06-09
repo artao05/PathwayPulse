@@ -14,10 +14,14 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field, ValidationError
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 from secrets_loader import load_secrets
 
@@ -25,6 +29,65 @@ load_secrets()
 
 log = logging.getLogger(__name__)
 ERROR_LOG = Path("errors.log")
+
+_OPENTARGETS_GRAPHQL = "https://api.platform.opentargets.org/api/v4/graphql"
+_REACTOME_ANALYSIS = "https://reactome.org/AnalysisService"
+_CHEMBL_BASE = "https://www.ebi.ac.uk/chembl/api/data"
+_ENSEMBL_BASE = "https://rest.ensembl.org"
+_OPENFDA_BASE = "https://api.fda.gov"
+_UNIPROT_BASE = "https://rest.uniprot.org"
+_MAX_VALIDATION_TARGETS = 3
+_MAX_DISEASE_TARGET_ROWS = 100
+_MAX_REACTOME_GENES = 25
+_MAX_PHARMACOLOGY_DRUGS = 5
+_GENE_TOKEN_RE = re.compile(r"\b[A-Z]{1,5}(?:-?[A-Z0-9]{1,7})\b")
+_DRUG_SUFFIX_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9-]{3,}"
+    r"(?:mab|nib|tinib|limus|olimus|parib|ciclib|xaban|gliflozin|gliptin|stat|vir|cept)\b",
+    re.IGNORECASE,
+)
+_GENE_STOPWORDS = {
+    "A", "ACR", "AI", "AND", "API", "ASCO", "BLA", "CAR", "CT", "DNA", "FDA",
+    "GTP", "HIV", "IF", "IL", "IN", "IP", "IV", "JUN", "KOL", "LLM", "MHC",
+    "NCT", "NDA", "NOT", "OA", "OR", "PD", "RNA", "RSS", "TBD", "THE",
+    "TNF", "UI", "URL", "X",
+}
+_PATHWAY_WORDS_RE = re.compile(
+    r"\b(pathway|pathways|signaling|signal|cascade|axis|biology|biological|"
+    r"immune|immunology|oncology|therapy|therapeutic|disease)\b",
+    re.IGNORECASE,
+)
+_DRUG_STOPWORDS = {
+    "active comparator", "arm", "biological", "combination", "device", "diagnostic",
+    "dose", "drug", "experimental", "intervention", "iv", "oral", "other",
+    "placebo", "procedure", "radiation", "standard of care", "standard therapy",
+    "treatment", "unknown",
+}
+
+
+def _compact_text(value: str, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split())
+    return text[:limit]
+
+
+def _configured_env(key: str) -> str:
+    value = os.getenv(key, "").strip()
+    normalized = value.lower()
+    if not value or any(token in normalized for token in ("...", "replace-with", "you@example.com")):
+        return ""
+    return value
+
+
+def _strip_json_fences(raw: str) -> str:
+    """Remove accidental markdown fences around model JSON."""
+    text = (raw or "").strip()
+    fenced = re.match(r"^```(?:json|JSON)?\s*(.*?)\s*```$", text, flags=re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json|JSON)?\s*", "", text, count=1)
+        text = re.sub(r"\s*```$", "", text, count=1)
+    return text.strip()
 
 
 # ── Pydantic Schema ───────────────────────────────────────────────────────────
@@ -43,6 +106,20 @@ class CrossPollinationEvent(BaseModel):
     citation_count: Optional[int] = Field(default=None, description="OpenAlex citation count for DOI-bearing preprints, when available")
     published_version_source: str = Field(default="", description="Journal source for a published version, when OpenAlex identifies one")
     published_version_url: str = Field(default="", description="Landing page for a published journal version, when available")
+    validation_status: str = Field(default="not_run", description="Validation status: not_run | validated | partial | unresolved | error")
+    validation_notes: list[str] = Field(default_factory=list, description="Short notes from biological validation")
+    resolved_targets: list[dict[str, Any]] = Field(default_factory=list, description="OpenTargets-resolved target candidates for this event")
+    opentargets_disease_id: str = Field(default="", description="OpenTargets/EFO disease identifier for the novel indication")
+    opentargets_disease_name: str = Field(default="", description="OpenTargets disease name for the novel indication")
+    opentargets_target_id: str = Field(default="", description="Best matched OpenTargets target Ensembl ID")
+    opentargets_target_symbol: str = Field(default="", description="Best matched OpenTargets target symbol")
+    opentargets_association_score: Optional[float] = Field(default=None, description="OpenTargets target-disease association score; >0 means prior evidence exists")
+    opentargets_top_disease_targets: list[dict[str, Any]] = Field(default_factory=list, description="Top OpenTargets-associated targets for the novel indication")
+    reactome_pathway_hits: list[dict[str, Any]] = Field(default_factory=list, description="Top Reactome enrichment hits for resolved pathway targets")
+    reactome_pathway_match: str = Field(default="", description="Best Reactome pathway match for the baseline pathway")
+    reactome_pathway_fdr: Optional[float] = Field(default=None, description="FDR for the best Reactome pathway match")
+    ensembl_gene_annotations: list[dict[str, Any]] = Field(default_factory=list, description="Ensembl gene summaries for resolved targets")
+    uniprot_annotations: list[dict[str, Any]] = Field(default_factory=list, description="UniProt protein annotations for resolved targets")
 
 
 class TriageResult(BaseModel):
@@ -68,6 +145,27 @@ class TrialCatalyst(BaseModel):
     days_until_readout: Optional[int] = Field(default=None, description="Days until primary completion (negative = overdue)")
     bucket: str = Field(default="upcoming", description="overdue | imminent | near | upcoming | reported")
     results_posted: bool = Field(default=False, description="Whether results are already posted")
+
+
+class DrugPharmacologyProfile(BaseModel):
+    """Per-drug factual enrichment from ChEMBL and openFDA."""
+    drug_name: str = Field(description="Input drug/intervention name used for lookup")
+    status: str = Field(default="not_run", description="not_run | enriched | partial | unresolved")
+    notes: list[str] = Field(default_factory=list, description="Lookup notes and limitations")
+    chembl_molecule_id: str = Field(default="", description="Resolved ChEMBL molecule identifier")
+    chembl_pref_name: str = Field(default="", description="Preferred ChEMBL molecule name")
+    molecule_type: str = Field(default="", description="ChEMBL molecule type")
+    max_phase: Optional[float] = Field(default=None, description="Highest clinical phase recorded by ChEMBL")
+    first_approval: Optional[int] = Field(default=None, description="First approval year recorded by ChEMBL")
+    black_box_warning: Optional[bool] = Field(default=None, description="ChEMBL black-box warning flag when available")
+    mechanisms: list[dict[str, Any]] = Field(default_factory=list, description="ChEMBL mechanism-of-action records")
+    bioactivities: list[dict[str, Any]] = Field(default_factory=list, description="Representative ChEMBL IC50/Ki bioactivities")
+    indications: list[dict[str, Any]] = Field(default_factory=list, description="Representative ChEMBL drug indications")
+    openfda_total_events: Optional[int] = Field(default=None, description="Total matching FAERS reports in openFDA")
+    openfda_serious_events: Optional[int] = Field(default=None, description="Serious matching FAERS reports in openFDA")
+    openfda_top_reactions: list[dict[str, Any]] = Field(default_factory=list, description="Top openFDA MedDRA reaction terms")
+    openfda_label_warnings: list[str] = Field(default_factory=list, description="Selected warning/boxed-warning text from FDA labels")
+    openfda_label_indications: list[str] = Field(default_factory=list, description="Selected indication text from FDA labels")
 
 
 # ── Synthesizer (DeepSeek-V3 via AI/ML API) ───────────────────────────────────
@@ -153,10 +251,7 @@ async def _triage_single(
             )
             raw = resp.choices[0].message.content
 
-            # Strip accidental markdown code fences if the model adds them
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+            raw = _strip_json_fences(raw)
 
             parsed = TriageResult.model_validate_json(raw)
             # Stamp provenance from the record — deterministic, never LLM-generated
@@ -224,13 +319,1219 @@ async def triage_data_batch(
     return events
 
 
+# ── Validation Engine (OpenTargets + Reactome) ───────────────────────────────
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _opentargets_post(query: str, variables: dict[str, Any]) -> dict:
+    resp = requests.post(
+        _OPENTARGETS_GRAPHQL,
+        json={"query": query, "variables": variables},
+        timeout=25,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("errors"):
+        message = data["errors"][0].get("message", "OpenTargets GraphQL error")
+        raise RuntimeError(message)
+    return data.get("data", {})
+
+
+_OT_SEARCH_TARGET_QUERY = """
+query searchTarget($queryString: String!, $page: Pagination) {
+  search(queryString: $queryString, entityNames: ["target"], page: $page) {
+    hits {
+      id
+      name
+      description
+      entity
+    }
+  }
+}
+"""
+
+_OT_SEARCH_DISEASE_QUERY = """
+query searchDisease($queryString: String!, $page: Pagination) {
+  search(queryString: $queryString, entityNames: ["disease"], page: $page) {
+    hits {
+      id
+      name
+      description
+      entity
+    }
+  }
+}
+"""
+
+_OT_ASSOCIATED_TARGETS_QUERY = """
+query associatedTargets($efoId: String!) {
+  disease(efoId: $efoId) {
+    id
+    name
+    associatedTargets(page: {index: 0, size: 100}) {
+      count
+      rows {
+        score
+        target {
+          id
+          approvedSymbol
+          approvedName
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def _opentargets_search(query: str, entity: str, page_size: int = 5) -> list[dict[str, Any]]:
+    query = query.strip()
+    if not query:
+        return []
+    gql = _OT_SEARCH_DISEASE_QUERY if entity == "disease" else _OT_SEARCH_TARGET_QUERY
+    data = _opentargets_post(
+        gql,
+        {"queryString": query, "page": {"index": 0, "size": page_size}},
+    )
+    return [
+        {
+            "id": hit.get("id", ""),
+            "name": hit.get("name", ""),
+            "description": _compact_text(hit.get("description", ""), 180),
+            "entity": hit.get("entity", entity),
+            "query": query,
+        }
+        for hit in data.get("search", {}).get("hits", [])
+        if hit.get("id")
+    ]
+
+
+def _normalize_gene_token(token: str) -> str:
+    return token.strip().replace("-", "").upper()
+
+
+def _extract_gene_candidates(*texts: str, max_candidates: int = 8) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for text in texts:
+        for match in _GENE_TOKEN_RE.findall(text or ""):
+            raw = match.strip()
+            normalized = _normalize_gene_token(raw)
+            if len(normalized) < 2 or normalized in _GENE_STOPWORDS:
+                continue
+            if not any(ch.isdigit() for ch in normalized) and len(normalized) <= 2:
+                continue
+            for value in (raw, normalized):
+                clean = value.strip()
+                key = clean.upper()
+                if clean and key not in seen:
+                    seen.add(key)
+                    candidates.append(clean)
+            if len(candidates) >= max_candidates:
+                return candidates[:max_candidates]
+    return candidates[:max_candidates]
+
+
+def _target_search_terms(event: CrossPollinationEvent, pathway: str) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str):
+        value = _compact_text(value, 80).strip(" -:;,")
+        if not value:
+            return
+        key = value.lower()
+        if key not in seen:
+            seen.add(key)
+            terms.append(value)
+
+    for source in (event.baseline_pathway, pathway):
+        add(source)
+        stripped = _PATHWAY_WORDS_RE.sub(" ", source or "")
+        add(stripped)
+
+    for token in _extract_gene_candidates(
+        event.baseline_pathway,
+        pathway,
+        event.source_evidence,
+        event.source_title,
+    ):
+        add(token)
+
+    return terms[:6]
+
+
+def _resolve_targets(
+    event: CrossPollinationEvent,
+    pathway: str,
+    target_cache: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for term in _target_search_terms(event, pathway):
+        cache_key = term.lower()
+        if cache_key not in target_cache:
+            try:
+                target_cache[cache_key] = _opentargets_search(term, "target", page_size=5)
+            except Exception as e:
+                log.warning("OpenTargets target search failed for '%s': %s", term, e)
+                target_cache[cache_key] = []
+
+        for hit in target_cache[cache_key]:
+            target_id = hit.get("id", "")
+            if not target_id.startswith("ENSG") or target_id in seen:
+                continue
+            seen.add(target_id)
+            targets.append({
+                "id": target_id,
+                "symbol": hit.get("name", ""),
+                "description": hit.get("description", ""),
+                "query": hit.get("query", term),
+            })
+            if len(targets) >= _MAX_VALIDATION_TARGETS:
+                return targets
+
+    return targets
+
+
+def _resolve_disease(
+    disease_name: str,
+    disease_cache: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    cache_key = disease_name.lower().strip()
+    if not cache_key:
+        return {}
+    if cache_key in disease_cache:
+        return disease_cache[cache_key]
+
+    try:
+        hits = _opentargets_search(disease_name, "disease", page_size=5)
+    except Exception as e:
+        log.warning("OpenTargets disease search failed for '%s': %s", disease_name, e)
+        hits = []
+
+    disease = {}
+    if hits:
+        best = hits[0]
+        disease = {
+            "id": best.get("id", ""),
+            "name": best.get("name", ""),
+            "description": best.get("description", ""),
+            "query": disease_name,
+        }
+    disease_cache[cache_key] = disease
+    return disease
+
+
+def _associated_targets_for_disease(
+    disease_id: str,
+    association_cache: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not disease_id:
+        return {}
+    if disease_id in association_cache:
+        return association_cache[disease_id]
+
+    try:
+        data = _opentargets_post(_OT_ASSOCIATED_TARGETS_QUERY, {"efoId": disease_id})
+        disease_data = data.get("disease") or {}
+        associated = disease_data.get("associatedTargets") or {}
+        rows = associated.get("rows") or []
+        result = {
+            "count": associated.get("count", 0),
+            "rows": rows[:_MAX_DISEASE_TARGET_ROWS],
+        }
+    except Exception as e:
+        log.warning("OpenTargets association lookup failed for '%s': %s", disease_id, e)
+        result = {}
+
+    association_cache[disease_id] = result
+    return result
+
+
+def _score_target_disease_association(
+    targets: list[dict[str, Any]],
+    disease: dict[str, Any],
+    association_cache: dict[str, dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    if not targets or not disease.get("id"):
+        return None, []
+
+    associated = _associated_targets_for_disease(disease["id"], association_cache)
+    rows = associated.get("rows") or []
+    target_ids = {target.get("id") for target in targets}
+    target_symbols = {str(target.get("symbol", "")).upper() for target in targets}
+
+    top_targets: list[dict[str, Any]] = []
+    best_match: Optional[dict[str, Any]] = None
+    for idx, row in enumerate(rows):
+        target = row.get("target") or {}
+        score = float(row.get("score") or 0)
+        row_summary = {
+            "rank": idx + 1,
+            "target_id": target.get("id", ""),
+            "target_symbol": target.get("approvedSymbol", ""),
+            "target_name": target.get("approvedName", ""),
+            "score": score,
+        }
+        if idx < 5:
+            top_targets.append(row_summary)
+
+        symbol = str(target.get("approvedSymbol", "")).upper()
+        if target.get("id") in target_ids or symbol in target_symbols:
+            if best_match is None or score > best_match.get("score", 0):
+                best_match = row_summary
+
+    if best_match is None and targets:
+        first = targets[0]
+        best_match = {
+            "rank": None,
+            "target_id": first.get("id", ""),
+            "target_symbol": first.get("symbol", ""),
+            "target_name": first.get("description", ""),
+            "score": 0.0,
+        }
+
+    return best_match, top_targets
+
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _reactome_analyze(identifiers: list[str]) -> dict:
+    resp = requests.post(
+        f"{_REACTOME_ANALYSIS}/identifiers/",
+        params={
+            "species": "9606",
+            "pageSize": 10,
+            "sortBy": "ENTITIES_FDR",
+            "order": "ASC",
+        },
+        data="\n".join(identifiers),
+        headers={"Accept": "application/json", "Content-Type": "text/plain"},
+        timeout=25,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _reactome_pathway_hits(gene_symbols: list[str]) -> list[dict[str, Any]]:
+    clean_symbols = []
+    seen: set[str] = set()
+    for symbol in gene_symbols:
+        normalized = _normalize_gene_token(symbol)
+        if normalized and normalized not in seen and normalized not in _GENE_STOPWORDS:
+            seen.add(normalized)
+            clean_symbols.append(normalized)
+        if len(clean_symbols) >= _MAX_REACTOME_GENES:
+            break
+
+    if not clean_symbols:
+        return []
+
+    try:
+        data = _reactome_analyze(clean_symbols)
+    except Exception as e:
+        log.warning("Reactome enrichment failed for %d genes: %s", len(clean_symbols), e)
+        return []
+
+    hits: list[dict[str, Any]] = []
+    for pathway in (data.get("pathways") or [])[:10]:
+        entities = pathway.get("entities") or {}
+        hits.append({
+            "reactome_id": pathway.get("stId") or pathway.get("id", ""),
+            "name": pathway.get("name", ""),
+            "fdr": entities.get("fdr"),
+            "p_value": entities.get("pValue"),
+            "entities_found": entities.get("found"),
+            "entities_total": entities.get("total"),
+            "submitted_genes": clean_symbols,
+        })
+    return hits
+
+
+def _best_reactome_match(pathway_name: str, hits: list[dict[str, Any]]) -> tuple[str, Optional[float]]:
+    if not hits:
+        return "", None
+
+    pathway_terms = {
+        t.lower()
+        for t in re.findall(r"[A-Za-z0-9]+", _PATHWAY_WORDS_RE.sub(" ", pathway_name or ""))
+        if len(t) >= 3
+    }
+    if pathway_terms:
+        for hit in hits:
+            hit_terms = {t.lower() for t in re.findall(r"[A-Za-z0-9]+", hit.get("name", ""))}
+            if pathway_terms.intersection(hit_terms):
+                return hit.get("name", ""), hit.get("fdr")
+
+    first = hits[0]
+    return first.get("name", ""), first.get("fdr")
+
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _ensembl_get(path: str, params: Optional[dict[str, Any]] = None) -> Any:
+    resp = requests.get(
+        f"{_ENSEMBL_BASE}/{path.strip('/')}",
+        params=params or {},
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        timeout=25,
+    )
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code == 429 or resp.status_code >= 500:
+        resp.raise_for_status()
+    if resp.status_code >= 400:
+        log.warning("Ensembl request failed (%s): %s", resp.status_code, resp.text[:200])
+        return {}
+    return resp.json()
+
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _uniprot_get(path: str, params: Optional[dict[str, Any]] = None) -> dict:
+    resp = requests.get(
+        f"{_UNIPROT_BASE}/{path.strip('/')}",
+        params=params or {},
+        headers={"Accept": "application/json"},
+        timeout=25,
+    )
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code == 429 or resp.status_code >= 500:
+        resp.raise_for_status()
+    if resp.status_code >= 400:
+        log.warning("UniProt request failed (%s): %s", resp.status_code, resp.text[:200])
+        return {}
+    return resp.json()
+
+
+def _ensembl_summary(data: dict[str, Any], query: str = "") -> dict[str, Any]:
+    if not data or not data.get("id"):
+        return {}
+    strand = data.get("strand")
+    strand_label = "+" if strand == 1 else "-" if strand == -1 else ""
+    return {
+        "query": query,
+        "ensembl_gene_id": data.get("id", ""),
+        "symbol": data.get("display_name", ""),
+        "biotype": data.get("biotype", ""),
+        "description": _compact_text(data.get("description", ""), 220),
+        "assembly_name": data.get("assembly_name", ""),
+        "seq_region_name": data.get("seq_region_name", ""),
+        "start": data.get("start"),
+        "end": data.get("end"),
+        "strand": strand_label,
+    }
+
+
+def _resolve_ensembl_gene(
+    target: dict[str, Any],
+    ensembl_cache: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    symbol = str(target.get("symbol") or "").strip()
+    ensembl_id = str(target.get("id") or "").strip()
+    cache_key = ensembl_id or symbol.upper()
+    if not cache_key:
+        return {}
+    if cache_key in ensembl_cache:
+        return ensembl_cache[cache_key]
+
+    data: dict[str, Any] = {}
+    if ensembl_id.startswith("ENSG"):
+        try:
+            data = _ensembl_get(f"lookup/id/{quote(ensembl_id)}") or {}
+        except Exception as e:
+            log.warning("Ensembl ID lookup failed for '%s': %s", ensembl_id, e)
+            data = {}
+
+    if not data and symbol:
+        try:
+            data = _ensembl_get(
+                f"lookup/symbol/human/{quote(symbol, safe='')}",
+                {"expand": 0},
+            ) or {}
+        except Exception as e:
+            log.warning("Ensembl symbol lookup failed for '%s': %s", symbol, e)
+            data = {}
+
+    if not data and symbol:
+        try:
+            fallback = _ensembl_get(f"xrefs/symbol/human/{quote(symbol, safe='')}") or []
+        except Exception as e:
+            log.warning("Ensembl synonym lookup failed for '%s': %s", symbol, e)
+            fallback = []
+        for item in fallback if isinstance(fallback, list) else []:
+            if item.get("type") != "gene" or not item.get("id"):
+                continue
+            try:
+                data = _ensembl_get(f"lookup/id/{quote(item['id'])}") or {}
+            except Exception as e:
+                log.warning("Ensembl fallback ID lookup failed for '%s': %s", item["id"], e)
+                data = {}
+            if data:
+                break
+
+    summary = _ensembl_summary(data, query=symbol or ensembl_id)
+    ensembl_cache[cache_key] = summary
+    if symbol:
+        ensembl_cache[symbol.upper()] = summary
+    if ensembl_id:
+        ensembl_cache[ensembl_id] = summary
+    return summary
+
+
+def _ensembl_uniprot_accessions(
+    ensembl_gene_id: str,
+    xref_cache: dict[str, list[str]],
+) -> list[str]:
+    if not ensembl_gene_id:
+        return []
+    if ensembl_gene_id in xref_cache:
+        return xref_cache[ensembl_gene_id]
+
+    try:
+        data = _ensembl_get(
+            f"xrefs/id/{quote(ensembl_gene_id)}",
+            {"external_db": "UniProt", "all_levels": 1},
+        )
+    except Exception as e:
+        log.warning("Ensembl UniProt xref lookup failed for '%s': %s", ensembl_gene_id, e)
+        data = []
+
+    accessions: list[str] = []
+    seen: set[str] = set()
+    for row in data if isinstance(data, list) else []:
+        accession = str(row.get("primary_id") or row.get("display_id") or "").strip()
+        if accession and accession not in seen:
+            seen.add(accession)
+            accessions.append(accession)
+    xref_cache[ensembl_gene_id] = accessions[:5]
+    return accessions[:5]
+
+
+def _uniprot_recommended_name(entry: dict[str, Any]) -> str:
+    desc = entry.get("proteinDescription") or {}
+    recommended = desc.get("recommendedName") or {}
+    full_name = recommended.get("fullName") or {}
+    if full_name.get("value"):
+        return full_name["value"]
+    submission_names = desc.get("submissionNames") or []
+    if submission_names:
+        full_name = submission_names[0].get("fullName") or {}
+        return full_name.get("value", "")
+    return ""
+
+
+def _uniprot_gene_names(entry: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for gene in entry.get("genes", []) or []:
+        primary = gene.get("geneName") or {}
+        if primary.get("value"):
+            names.append(primary["value"])
+        for synonym in gene.get("synonyms", []) or []:
+            if synonym.get("value"):
+                names.append(synonym["value"])
+    return list(dict.fromkeys(names))[:8]
+
+
+def _uniprot_comment_texts(entry: dict[str, Any], comment_type: str, limit: int = 2) -> list[str]:
+    values: list[str] = []
+    for comment in entry.get("comments", []) or []:
+        if comment.get("commentType") != comment_type:
+            continue
+        for text in comment.get("texts", []) or []:
+            value = _compact_text(text.get("value", ""), 300)
+            if value:
+                values.append(value)
+        if comment_type == "SUBCELLULAR LOCATION":
+            for location in comment.get("subcellularLocations", []) or []:
+                loc = (location.get("location") or {}).get("value", "")
+                if loc:
+                    values.append(loc)
+        if len(values) >= limit:
+            break
+    return list(dict.fromkeys(values))[:limit]
+
+
+def _uniprot_go_terms(entry: dict[str, Any], limit: int = 8) -> list[dict[str, str]]:
+    terms: list[dict[str, str]] = []
+    for xref in entry.get("uniProtKBCrossReferences", []) or []:
+        if xref.get("database") != "GO":
+            continue
+        props = {
+            prop.get("key"): prop.get("value")
+            for prop in xref.get("properties", []) or []
+            if isinstance(prop, dict)
+        }
+        terms.append({
+            "id": xref.get("id", ""),
+            "term": props.get("GoTerm", ""),
+            "evidence": props.get("GoEvidenceType", ""),
+        })
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _uniprot_summary(entry: dict[str, Any], query_symbol: str = "") -> dict[str, Any]:
+    if not entry or not entry.get("primaryAccession"):
+        return {}
+    sequence = entry.get("sequence") or {}
+    organism = entry.get("organism") or {}
+    return {
+        "query_symbol": query_symbol,
+        "accession": entry.get("primaryAccession", ""),
+        "entry_name": entry.get("uniProtkbId", ""),
+        "reviewed": entry.get("entryType") == "UniProtKB reviewed (Swiss-Prot)",
+        "protein_name": _uniprot_recommended_name(entry),
+        "gene_names": _uniprot_gene_names(entry),
+        "organism": organism.get("scientificName", ""),
+        "sequence_length": sequence.get("length"),
+        "molecular_weight": sequence.get("molWeight"),
+        "functions": _uniprot_comment_texts(entry, "FUNCTION", limit=2),
+        "subcellular_locations": _uniprot_comment_texts(entry, "SUBCELLULAR LOCATION", limit=4),
+        "go_terms": _uniprot_go_terms(entry, limit=8),
+    }
+
+
+def _resolve_uniprot_annotation(
+    symbol: str,
+    accessions: list[str],
+    uniprot_cache: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    cache_key = (accessions[0] if accessions else symbol.upper()).strip()
+    if not cache_key:
+        return {}
+    if cache_key in uniprot_cache:
+        return uniprot_cache[cache_key]
+
+    entry: dict[str, Any] = {}
+    for accession in accessions[:3]:
+        try:
+            entry = _uniprot_get(f"uniprotkb/{quote(accession)}", {"format": "json"}) or {}
+        except Exception as e:
+            log.warning("UniProt accession lookup failed for '%s': %s", accession, e)
+            entry = {}
+        if entry.get("primaryAccession"):
+            break
+
+    if not entry and symbol:
+        try:
+            data = _uniprot_get(
+                "uniprotkb/search",
+                {
+                    "query": f"gene:{symbol} AND organism_id:9606 AND reviewed:true",
+                    "format": "json",
+                    "size": 1,
+                },
+            )
+        except Exception as e:
+            log.warning("UniProt gene search failed for '%s': %s", symbol, e)
+            data = {}
+        results = data.get("results") or []
+        if results:
+            entry = results[0]
+
+    summary = _uniprot_summary(entry, query_symbol=symbol)
+    uniprot_cache[cache_key] = summary
+    if symbol:
+        uniprot_cache[symbol.upper()] = summary
+    return summary
+
+
+def _deep_target_annotations(
+    targets: list[dict[str, Any]],
+    ensembl_cache: dict[str, dict[str, Any]],
+    xref_cache: dict[str, list[str]],
+    uniprot_cache: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ensembl_annotations: list[dict[str, Any]] = []
+    uniprot_annotations: list[dict[str, Any]] = []
+    seen_ensembl: set[str] = set()
+    seen_uniprot: set[str] = set()
+
+    for target in targets[:_MAX_VALIDATION_TARGETS]:
+        ensembl = _resolve_ensembl_gene(target, ensembl_cache)
+        if ensembl and ensembl.get("ensembl_gene_id") not in seen_ensembl:
+            seen_ensembl.add(ensembl.get("ensembl_gene_id", ""))
+            ensembl_annotations.append(ensembl)
+
+        symbol = ensembl.get("symbol") or target.get("symbol", "")
+        accessions = _ensembl_uniprot_accessions(ensembl.get("ensembl_gene_id", ""), xref_cache)
+        uniprot = _resolve_uniprot_annotation(symbol, accessions, uniprot_cache)
+        if uniprot and uniprot.get("accession") not in seen_uniprot:
+            seen_uniprot.add(uniprot.get("accession", ""))
+            uniprot_annotations.append(uniprot)
+
+    return ensembl_annotations, uniprot_annotations
+
+
+def validate_events(
+    events: list[CrossPollinationEvent],
+    pathway: str,
+) -> list[CrossPollinationEvent]:
+    """
+    Ground Synthesizer events with OpenTargets and Reactome context.
+
+    Returns new event objects. Any failed API call degrades to partial notes
+    instead of blocking report generation.
+    """
+    if not events:
+        return []
+
+    target_cache: dict[str, list[dict[str, Any]]] = {}
+    disease_cache: dict[str, dict[str, Any]] = {}
+    association_cache: dict[str, dict[str, Any]] = {}
+    ensembl_cache: dict[str, dict[str, Any]] = {}
+    ensembl_xref_cache: dict[str, list[str]] = {}
+    uniprot_cache: dict[str, dict[str, Any]] = {}
+    validated_events: list[CrossPollinationEvent] = []
+    gene_symbols: list[str] = []
+
+    for event in events:
+        notes: list[str] = []
+        targets = _resolve_targets(event, pathway, target_cache)
+        if not targets:
+            notes.append("No OpenTargets target resolved from pathway/evidence text.")
+        else:
+            gene_symbols.extend([target.get("symbol", "") for target in targets if target.get("symbol")])
+
+        ensembl_annotations, uniprot_annotations = _deep_target_annotations(
+            targets,
+            ensembl_cache,
+            ensembl_xref_cache,
+            uniprot_cache,
+        )
+        if targets and not ensembl_annotations:
+            notes.append("No Ensembl gene annotations resolved for target candidates.")
+        if targets and not uniprot_annotations:
+            notes.append("No UniProt protein annotations resolved for target candidates.")
+
+        disease = _resolve_disease(event.novel_indication, disease_cache)
+        if not disease:
+            notes.append("No OpenTargets disease resolved for novel indication.")
+
+        association, top_targets = _score_target_disease_association(
+            targets,
+            disease,
+            association_cache,
+        )
+        status = "validated"
+        if not targets or not disease:
+            status = "unresolved"
+        elif association is None:
+            status = "partial"
+
+        if association and association.get("score", 0) > 0:
+            notes.append(
+                "OpenTargets has prior target-disease evidence; signal may be less novel."
+            )
+        elif association and association.get("score") == 0:
+            notes.append(
+                "Resolved target is not in the top OpenTargets-associated targets for this disease."
+            )
+
+        validated_events.append(event.model_copy(update={
+            "validation_status": status,
+            "validation_notes": notes,
+            "resolved_targets": targets,
+            "opentargets_disease_id": disease.get("id", ""),
+            "opentargets_disease_name": disease.get("name", ""),
+            "opentargets_target_id": (association or {}).get("target_id", ""),
+            "opentargets_target_symbol": (association or {}).get("target_symbol", ""),
+            "opentargets_association_score": (association or {}).get("score"),
+            "opentargets_top_disease_targets": top_targets,
+            "ensembl_gene_annotations": ensembl_annotations,
+            "uniprot_annotations": uniprot_annotations,
+        }))
+
+    reactome_hits = _reactome_pathway_hits(gene_symbols)
+    if not reactome_hits:
+        return [
+            event.model_copy(update={
+                "validation_notes": event.validation_notes + [
+                    "Reactome enrichment returned no pathway hits."
+                ],
+            })
+            for event in validated_events
+        ]
+
+    enriched_events: list[CrossPollinationEvent] = []
+    for event in validated_events:
+        match_name, match_fdr = _best_reactome_match(event.baseline_pathway, reactome_hits)
+        enriched_events.append(event.model_copy(update={
+            "reactome_pathway_hits": reactome_hits,
+            "reactome_pathway_match": match_name,
+            "reactome_pathway_fdr": match_fdr,
+        }))
+
+    log.info("Validation Engine: validated %d events (%d Reactome hits)", len(events), len(reactome_hits))
+    return enriched_events
+
+
+async def validate_events_async(
+    events: list[CrossPollinationEvent],
+    pathway: str,
+) -> list[CrossPollinationEvent]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, validate_events, events, pathway)
+
+
+# ── Pharmacology Enrichment (ChEMBL + openFDA) ───────────────────────────────
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _chembl_get(endpoint: str, params: Optional[dict[str, Any]] = None) -> dict:
+    resp = requests.get(
+        f"{_CHEMBL_BASE}/{endpoint.strip('/')}.json",
+        params=params or {},
+        timeout=25,
+    )
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code == 429 or resp.status_code >= 500:
+        resp.raise_for_status()
+    if resp.status_code >= 400:
+        log.warning("ChEMBL request failed (%s): %s", resp.status_code, resp.text[:200])
+        return {}
+    return resp.json()
+
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=10), stop=stop_after_attempt(3))
+def _openfda_get(path: str, params: dict[str, Any]) -> dict:
+    merged = dict(params)
+    api_key = _configured_env("FDA_API_KEY")
+    if api_key:
+        merged["api_key"] = api_key
+
+    resp = requests.get(
+        f"{_OPENFDA_BASE}/{path.strip('/')}.json",
+        params=merged,
+        timeout=25,
+    )
+    if resp.status_code == 404:
+        return {}
+    if resp.status_code == 429 or resp.status_code >= 500:
+        resp.raise_for_status()
+    if resp.status_code >= 400:
+        log.warning("openFDA request failed (%s): %s", resp.status_code, resp.text[:200])
+        return {}
+    return resp.json()
+
+
+_UNIT_CONVERSION_TO_NM = {
+    "nm": 1.0,
+    "um": 1e3,
+    "µm": 1e3,
+    "mm": 1e6,
+    "m": 1e9,
+    "pm": 1e-3,
+    "fm": 1e-6,
+}
+
+
+def _clean_drug_name(value: str) -> str:
+    name = " ".join(str(value or "").split())
+    name = re.sub(r"^(drug|biological|other|combination product)\s*:\s*", "", name, flags=re.I)
+    name = re.sub(r"\([^)]*\)", " ", name)
+    name = re.sub(
+        r"\b(tablet|capsule|injection|injectable|infusion|solution|suspension|"
+        r"subcutaneous|intravenous|oral|placebo|dose|mg|mcg|ug|ml)\b.*$",
+        " ",
+        name,
+        flags=re.I,
+    )
+    return " ".join(name.strip(" -:;,").split())
+
+
+def _add_drug_candidate(value: str, candidates: list[str], seen: set[str]) -> None:
+    name = _clean_drug_name(value)
+    if not name:
+        return
+    key = name.lower()
+    if key in _DRUG_STOPWORDS or len(name) < 4 or key in seen:
+        return
+    seen.add(key)
+    candidates.append(name)
+
+
+def _split_drug_candidates(value: str) -> list[str]:
+    parts = re.split(r"[,;/\n]|\s+\+\s+|\s+with\s+", value or "", flags=re.I)
+    return [p for p in parts if p.strip()]
+
+
+def discover_drug_candidates(
+    events: list[CrossPollinationEvent],
+    catalysts: Optional[list[dict]] = None,
+    drug: str = "",
+) -> list[str]:
+    """Find likely drug/intervention names worth pharmacology lookup."""
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for part in _split_drug_candidates(drug):
+        _add_drug_candidate(part, candidates, seen)
+
+    for catalyst in catalysts or []:
+        for intervention in catalyst.get("interventions", []) or []:
+            for part in _split_drug_candidates(intervention):
+                _add_drug_candidate(part, candidates, seen)
+
+    for event in events:
+        text = " ".join([
+            event.source_title,
+            event.source_evidence,
+            event.original_indication,
+            event.novel_indication,
+        ])
+        for match in _DRUG_SUFFIX_RE.findall(text):
+            _add_drug_candidate(match, candidates, seen)
+            if len(candidates) >= _MAX_PHARMACOLOGY_DRUGS:
+                return candidates[:_MAX_PHARMACOLOGY_DRUGS]
+
+    return candidates[:_MAX_PHARMACOLOGY_DRUGS]
+
+
+def _chembl_resolve_molecule(drug_name: str) -> dict[str, Any]:
+    try:
+        data = _chembl_get("molecule/search", {"q": drug_name, "limit": 5})
+    except Exception as e:
+        log.warning("ChEMBL molecule search failed for '%s': %s", drug_name, e)
+        return {}
+
+    molecules = data.get("molecules") or []
+    if not molecules:
+        return {}
+
+    name_key = drug_name.lower()
+    for molecule in molecules:
+        pref_name = str(molecule.get("pref_name") or "").lower()
+        synonyms = [
+            str(syn.get("molecule_synonym") or "").lower()
+            for syn in molecule.get("molecule_synonyms", []) or []
+            if isinstance(syn, dict)
+        ]
+        if pref_name == name_key or name_key in synonyms:
+            return molecule
+    return molecules[0]
+
+
+def _chembl_mechanisms(molecule_id: str) -> list[dict[str, Any]]:
+    if not molecule_id:
+        return []
+    try:
+        data = _chembl_get("mechanism", {"molecule_chembl_id": molecule_id, "limit": 8})
+    except Exception as e:
+        log.warning("ChEMBL mechanism lookup failed for '%s': %s", molecule_id, e)
+        return []
+
+    mechanisms: list[dict[str, Any]] = []
+    for row in data.get("mechanisms", [])[:8]:
+        mechanisms.append({
+            "mechanism_of_action": row.get("mechanism_of_action", ""),
+            "action_type": row.get("action_type", ""),
+            "target_chembl_id": row.get("target_chembl_id", ""),
+            "target_name": row.get("target_name", ""),
+            "binding_site_name": row.get("binding_site_name", ""),
+        })
+    return mechanisms
+
+
+def _normalize_activity_value(record: dict[str, Any]) -> Optional[float]:
+    units = str(record.get("standard_units") or "").strip().lower()
+    value = record.get("standard_value")
+    if value is None or units not in _UNIT_CONVERSION_TO_NM:
+        return None
+    try:
+        return float(value) * _UNIT_CONVERSION_TO_NM[units]
+    except (TypeError, ValueError):
+        return None
+
+
+def _chembl_bioactivities(molecule_id: str) -> list[dict[str, Any]]:
+    if not molecule_id:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for standard_type in ("IC50", "Ki"):
+        try:
+            data = _chembl_get(
+                "activity",
+                {
+                    "molecule_chembl_id": molecule_id,
+                    "standard_type": standard_type,
+                    "standard_value__isnull": "false",
+                    "limit": 12,
+                },
+            )
+        except Exception as e:
+            log.warning("ChEMBL %s activity lookup failed for '%s': %s", standard_type, molecule_id, e)
+            continue
+
+        for record in data.get("activities", []) or []:
+            normalized_nm = _normalize_activity_value(record)
+            rows.append({
+                "standard_type": record.get("standard_type", ""),
+                "standard_relation": record.get("standard_relation", ""),
+                "standard_value": record.get("standard_value"),
+                "standard_units": record.get("standard_units", ""),
+                "normalized_value_nM": normalized_nm,
+                "pchembl_value": record.get("pchembl_value"),
+                "target_chembl_id": record.get("target_chembl_id", ""),
+                "target_pref_name": record.get("target_pref_name", ""),
+                "assay_description": _compact_text(record.get("assay_description", ""), 180),
+            })
+
+    def sort_key(row: dict[str, Any]) -> tuple[float, float]:
+        nm = row.get("normalized_value_nM")
+        pchembl = row.get("pchembl_value")
+        try:
+            pchembl_score = -float(pchembl) if pchembl is not None else 0.0
+        except (TypeError, ValueError):
+            pchembl_score = 0.0
+        return (float(nm) if nm is not None else float("inf"), pchembl_score)
+
+    rows.sort(key=sort_key)
+    return rows[:8]
+
+
+def _chembl_indications(molecule_id: str) -> list[dict[str, Any]]:
+    if not molecule_id:
+        return []
+    try:
+        data = _chembl_get("drug_indication", {"molecule_chembl_id": molecule_id, "limit": 8})
+    except Exception as e:
+        log.warning("ChEMBL indication lookup failed for '%s': %s", molecule_id, e)
+        return []
+
+    indications: list[dict[str, Any]] = []
+    for row in data.get("drug_indications", [])[:8]:
+        indications.append({
+            "efo_id": row.get("efo_id", ""),
+            "mesh_heading": row.get("mesh_heading", ""),
+            "max_phase_for_ind": row.get("max_phase_for_ind"),
+        })
+    return indications
+
+
+def _openfda_event_queries(drug_name: str) -> list[str]:
+    exact = drug_name.upper()
+    return [
+        f'patient.drug.medicinalproduct.exact:"{exact}"',
+        f'patient.drug.openfda.generic_name.exact:"{exact}"',
+        f'patient.drug.openfda.brand_name.exact:"{exact}"',
+        f'patient.drug.medicinalproduct:"{drug_name}"',
+    ]
+
+
+def _openfda_label_queries(drug_name: str) -> list[str]:
+    exact = drug_name.upper()
+    return [
+        f'openfda.generic_name.exact:"{exact}"',
+        f'openfda.brand_name.exact:"{exact}"',
+        f'openfda.substance_name.exact:"{exact}"',
+        f'openfda.generic_name:"{drug_name}"',
+        f'openfda.brand_name:"{drug_name}"',
+    ]
+
+
+def _openfda_top_reactions(drug_name: str) -> tuple[Optional[int], list[dict[str, Any]], str]:
+    for query in _openfda_event_queries(drug_name):
+        try:
+            data = _openfda_get(
+                "drug/event",
+                {
+                    "search": query,
+                    "count": "patient.reaction.reactionmeddrapt.exact",
+                    "limit": 10,
+                },
+            )
+        except Exception as e:
+            log.warning("openFDA reaction count failed for '%s': %s", drug_name, e)
+            continue
+
+        results = data.get("results") or []
+        if results:
+            total = data.get("meta", {}).get("results", {}).get("total")
+            return total, [
+                {"reaction": row.get("term", ""), "count": row.get("count", 0)}
+                for row in results[:10]
+            ], query
+    return None, [], ""
+
+
+def _openfda_serious_events(event_query: str) -> Optional[int]:
+    if not event_query:
+        return None
+    try:
+        data = _openfda_get(
+            "drug/event",
+            {"search": f"{event_query} AND serious:1", "limit": 1},
+        )
+    except Exception as e:
+        log.warning("openFDA serious event count failed for '%s': %s", event_query, e)
+        return None
+    return data.get("meta", {}).get("results", {}).get("total")
+
+
+def _list_text_values(record: dict[str, Any], *keys: str, limit: int = 2, text_limit: int = 420) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        raw_values = record.get(key) or []
+        if isinstance(raw_values, str):
+            raw_values = [raw_values]
+        for value in raw_values:
+            text = _compact_text(value, text_limit)
+            lower = text.lower()
+            if text and lower not in seen:
+                seen.add(lower)
+                values.append(text)
+            if len(values) >= limit:
+                return values
+    return values
+
+
+def _openfda_label_summary(drug_name: str) -> tuple[list[str], list[str]]:
+    for query in _openfda_label_queries(drug_name):
+        try:
+            data = _openfda_get("drug/label", {"search": query, "limit": 1})
+        except Exception as e:
+            log.warning("openFDA label lookup failed for '%s': %s", drug_name, e)
+            continue
+        results = data.get("results") or []
+        if not results:
+            continue
+        label = results[0]
+        warnings = _list_text_values(
+            label,
+            "boxed_warning",
+            "warnings",
+            "warnings_and_cautions",
+            "contraindications",
+            limit=3,
+        )
+        indications = _list_text_values(label, "indications_and_usage", limit=2)
+        return warnings, indications
+    return [], []
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_drug_profile(drug_name: str) -> DrugPharmacologyProfile:
+    notes: list[str] = []
+    molecule = _chembl_resolve_molecule(drug_name)
+
+    molecule_id = molecule.get("molecule_chembl_id", "")
+    if not molecule_id:
+        notes.append("No ChEMBL molecule resolved.")
+
+    mechanisms = _chembl_mechanisms(molecule_id)
+    if molecule_id and not mechanisms:
+        notes.append("No ChEMBL mechanism-of-action rows found.")
+
+    bioactivities = _chembl_bioactivities(molecule_id)
+    if molecule_id and not bioactivities:
+        notes.append("No ChEMBL IC50/Ki activity rows found.")
+
+    indications = _chembl_indications(molecule_id)
+    total_events, top_reactions, event_query = _openfda_top_reactions(drug_name)
+    serious_events = _openfda_serious_events(event_query)
+    label_warnings, label_indications = _openfda_label_summary(drug_name)
+
+    if total_events is None and not top_reactions and not label_warnings:
+        notes.append("No openFDA event or label records resolved.")
+
+    status = "unresolved"
+    if molecule_id and (mechanisms or bioactivities or indications or top_reactions or label_warnings):
+        status = "enriched"
+    elif molecule_id or top_reactions or label_warnings:
+        status = "partial"
+
+    profile = DrugPharmacologyProfile(
+        drug_name=drug_name,
+        status=status,
+        notes=notes,
+        chembl_molecule_id=molecule_id,
+        chembl_pref_name=molecule.get("pref_name", "") or "",
+        molecule_type=molecule.get("molecule_type", "") or "",
+        max_phase=_coerce_float(molecule.get("max_phase")),
+        first_approval=_coerce_int(molecule.get("first_approval")),
+        black_box_warning=(
+            bool(molecule.get("black_box_warning"))
+            if molecule.get("black_box_warning") is not None else None
+        ),
+        mechanisms=mechanisms,
+        bioactivities=bioactivities,
+        indications=indications,
+        openfda_total_events=_coerce_int(total_events),
+        openfda_serious_events=_coerce_int(serious_events),
+        openfda_top_reactions=top_reactions,
+        openfda_label_warnings=label_warnings,
+        openfda_label_indications=label_indications,
+    )
+    return profile
+
+
+def enrich_pharmacology(
+    events: list[CrossPollinationEvent],
+    catalysts: Optional[list[dict]] = None,
+    drug: str = "",
+) -> list[DrugPharmacologyProfile]:
+    """
+    Build factual pharmacology profiles for drugs detected in the current run.
+
+    Uses native ChEMBL/openFDA HTTP calls. Failures degrade to notes or an
+    empty list so report generation can continue.
+    """
+    candidates = discover_drug_candidates(events, catalysts=catalysts, drug=drug)
+    if not candidates:
+        return []
+
+    profiles: list[DrugPharmacologyProfile] = []
+    for candidate in candidates:
+        try:
+            profiles.append(_build_drug_profile(candidate))
+        except Exception as e:
+            log.warning("Pharmacology enrichment failed for '%s': %s", candidate, e)
+            profiles.append(DrugPharmacologyProfile(
+                drug_name=candidate,
+                status="unresolved",
+                notes=[f"Pharmacology lookup failed: {type(e).__name__}"],
+            ))
+
+    log.info("Pharmacology Enrichment: built %d profiles", len(profiles))
+    return profiles
+
+
+async def enrich_pharmacology_async(
+    events: list[CrossPollinationEvent],
+    catalysts: Optional[list[dict]] = None,
+    drug: str = "",
+) -> list[DrugPharmacologyProfile]:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, enrich_pharmacology, events, catalysts, drug)
+
+
 # ── Executioner (gpt-4o via standard OpenAI) ──────────────────────────────────
 
 _EXECUTIONER_SYSTEM = """\
 You are a senior biotech analyst with deep expertise in immunology, oncology, and drug
 repurposing strategy. You have been given a set of detected biological pathway
-cross-pollination signals and (optionally) a Catalyst Calendar of upcoming clinical trial
-readouts.
+cross-pollination signals, biological validation context from OpenTargets and Reactome,
+deep gene/protein annotations from Ensembl and UniProt,
+optional pharmacology profiles from ChEMBL/openFDA, and (optionally) a Catalyst Calendar
+of upcoming clinical trial readouts.
 
 Your task: write a concise, rigorous arbitrage intelligence report in Markdown.
 
@@ -239,14 +1540,20 @@ Structure your report as follows:
 2. **Immunological Soundness** — Evaluate whether the detected novel indications are
    mechanistically plausible given the pathway's biology
 3. **Signal Quality** — Rank the top signals by confidence and explain what makes each
-   credible or speculative
+   credible or speculative. Use `opentargets_association_score`,
+   `opentargets_top_disease_targets`, `reactome_pathway_hits`,
+   `ensembl_gene_annotations`, and `uniprot_annotations` when present:
+   an OpenTargets score > 0 means prior target-disease evidence exists, while
+   0 or null means the resolved signal was not found or could not be resolved
+   in the checked slice.
 4. **Catalyst Calendar** — If trial catalysts are provided, highlight the most time-sensitive
    binary events: overdue readouts, imminent readouts (<90 days), and near-term readouts
    (90–180 days). Call out which catalysts could be market-moving and why. Include a
    markdown link to each trial using its url field. If no catalysts were provided, omit
    this section entirely.
 5. **Risk Factors** — What could invalidate these signals (competing pathways, trial failures,
-   regulatory hurdles)?
+   regulatory hurdles)? If `pharmacology_profiles` are provided, incorporate factual
+   ChEMBL mechanism/activity data and openFDA adverse-event/label context here.
 6. **Watch List** — Specific companies, trials, or papers to monitor
 
 Be direct. Use scientific terminology. Do not hedge excessively.
@@ -260,6 +1567,7 @@ def generate_arbitrage_report(
     pathway: str,
     model: str = "gpt-4o",
     catalysts: Optional[list[dict]] = None,
+    pharmacology_profiles: Optional[list[dict]] = None,
 ) -> str:
     """
     Generate a Bear/Bull/Neutral arbitrage report from detected CrossPollinationEvents
@@ -267,7 +1575,7 @@ def generate_arbitrage_report(
     Routes to gpt-4o (or o1 if specified) via standard OpenAI.
     Returns a markdown string.
     """
-    if not events and not catalysts:
+    if not events and not catalysts and not pharmacology_profiles:
         return (
             f"## PathwayPulse Report — {pathway}\n\n"
             "**Verdict: Neutral**\n\n"
@@ -289,6 +1597,14 @@ def generate_arbitrage_report(
         f"Biological pathway: {pathway}\n\n"
         f"Detected CrossPollinationEvents ({len(events)} total):\n```json\n{events_payload}\n```\n"
     )
+
+    if pharmacology_profiles:
+        pharma_payload = json.dumps(pharmacology_profiles, indent=2)
+        user_prompt += (
+            f"\nPharmacology Profiles ({len(pharmacology_profiles)} drugs, "
+            "from ChEMBL/openFDA):\n"
+            f"```json\n{pharma_payload}\n```\n"
+        )
 
     if catalysts:
         # Surface only the most actionable catalysts to the Executioner
@@ -333,18 +1649,34 @@ async def run_pipeline(
     executioner_model: str = "gpt-4o",
     concurrency: int = 10,
     catalysts: Optional[list[dict]] = None,
-) -> tuple[list[CrossPollinationEvent], str]:
+    include_validation: bool = True,
+    drug: str = "",
+    include_pharmacology: bool = True,
+) -> tuple[list[CrossPollinationEvent], str, list[DrugPharmacologyProfile]]:
     """
     Run the complete dual-model pipeline:
-      records → Synthesizer → events → Executioner (+ catalysts) → report
-    Returns (events, markdown_report).
+      records → Synthesizer → validation → pharmacology → Executioner (+ catalysts) → report
+    Returns (events, markdown_report, pharmacology_profiles).
     Catalysts are passed through to the Executioner but are not triage-processed.
     """
     events = await triage_data_batch(records, pathway, concurrency=concurrency)
+    if include_validation:
+        events = await validate_events_async(events, pathway)
+    pharmacology_profiles: list[DrugPharmacologyProfile] = []
+    if include_pharmacology:
+        pharmacology_profiles = await enrich_pharmacology_async(
+            events,
+            catalysts=catalysts,
+            drug=drug,
+        )
     report = generate_arbitrage_report(
-        events, pathway, model=executioner_model, catalysts=catalysts
+        events,
+        pathway,
+        model=executioner_model,
+        catalysts=catalysts,
+        pharmacology_profiles=[p.model_dump() for p in pharmacology_profiles] or None,
     )
-    return events, report
+    return events, report, pharmacology_profiles
 
 
 # ── Demo ─────────────────────────────────────────────────────────────────────
@@ -390,8 +1722,13 @@ if __name__ == "__main__":
 
     async def _demo():
         print("Running PathwayPulse pipeline demo (IL-6 signaling)...\n")
-        events, report = await run_pipeline(sample_records, "IL-6 signaling")
+        events, report, pharmacology_profiles = await run_pipeline(
+            sample_records,
+            "IL-6 signaling",
+            drug="tocilizumab",
+        )
         print(f"Events detected: {len(events)}")
+        print(f"Drug profiles: {len(pharmacology_profiles)}")
         for ev in events:
             print(f"  → {ev.original_indication} → {ev.novel_indication} (confidence: {ev.confidence_score:.2f})")
         print("\n--- ARBITRAGE REPORT ---\n")

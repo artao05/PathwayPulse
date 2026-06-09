@@ -2,7 +2,7 @@
 
 **Autonomous Biotech Arbitrage Engine** — detects cross-indication drug repurposing signals in real time.
 
-PathwayPulse monitors when a biological pathway proven in one disease (e.g., oncology) is quietly being applied to a completely different disease (e.g., autoimmune) — before the broader market notices. It ingests preprints, community commentary, conference abstracts, and clinical trial data, runs them through a two-stage AI pipeline, and renders the results as a live arbitrage graph with a written intelligence report.
+PathwayPulse monitors when a biological pathway proven in one disease (e.g., oncology) is quietly being applied to a completely different disease (e.g., autoimmune) — before the broader market notices. It ingests preprints, peer-reviewed literature, community commentary, conference abstracts, and clinical trial data; grounds detected signals with biological and pharmacology databases; then renders the results as a live arbitrage graph with a written intelligence report.
 
 Built for the [Web Data UNLOCKED Hackathon](https://brightdata.com).
 
@@ -17,6 +17,8 @@ Built for the [Web Data UNLOCKED Hackathon](https://brightdata.com).
 │  bioRxiv API ─────────────────────────────────────────────┐     │
 │  medRxiv API ─────────────────────────────────────────────┤     │
 │  Reddit RSS (5 subs) ─────────────────────────────────────┤     │
+│  PubMed E-utilities ─────────────────────────────────────┤     │
+│  OpenAlex citation metadata ─────────────────────────────┤     │
 │  ChemRxiv API (opt) ─────────────────────────────────────┤     │
 │  Grok xAI x_search (opt) ────────────────────────────────┤     │
 │  ClinicalTrials.gov API v2 ──────────────────────────────┤     │
@@ -33,6 +35,15 @@ Built for the [Web Data UNLOCKED Hackathon](https://brightdata.com).
                                │ structured events + catalyst list
                                ▼
 ┌─────────────────────────────────────────────────────────────────┐
+│             Validation + Enrichment Layer                       │
+│  OpenTargets target-disease evidence scores                     │
+│  Reactome pathway enrichment                                    │
+│  Ensembl gene resolution + UniProt protein annotations          │
+│  ChEMBL mechanisms / IC50 / Ki + openFDA safety context         │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │ grounded events + drug profiles
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
 │                  Executioner (GPT-4o)                           │
 │  Bear / Bull / Neutral verdict + immunological soundness eval   │
 │  Catalyst Calendar section (overdue + imminent readouts)        │
@@ -43,7 +54,7 @@ Built for the [Web Data UNLOCKED Hackathon](https://brightdata.com).
 ┌─────────────────────────────────────────────────────────────────┐
 │                   Streamlit Dashboard                           │
 │  Interactive node graph  │  Intelligence Report                 │
-│  Catalyst Calendar       │  Raw signal explorer                 │
+│  Catalyst Calendar       │  Validation + pharmacology panels    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,7 +65,7 @@ Built for the [Web Data UNLOCKED Hackathon](https://brightdata.com).
 ```
 PathwayPulse/
 ├── app.py                   # Streamlit dashboard — node graph, report, catalyst calendar
-├── ai_orchestrator.py       # Synthesizer (DeepSeek-V3) + Executioner (GPT-4o) pipeline
+├── ai_orchestrator.py       # AI pipeline + validation / pharmacology enrichment
 ├── swarm_ingestion.py       # All ingestion agents — preprints, Reddit, BrightData, CT API
 ├── test_connections.py      # API smoke-tests — run before first use
 ├── requirements.txt
@@ -70,10 +81,11 @@ PathwayPulse/
 ### 1. Prerequisites
 
 - Python 3.9+
-- [Bright Data](https://brightdata.com) account with a **Scraping Browser** zone
 - [AI/ML API](https://aimlapi.com) key (routes to DeepSeek-V3)
 - [OpenAI](https://platform.openai.com) API key (GPT-4o)
+- *(Optional)* [Bright Data](https://brightdata.com) Scraping Browser zone for ACR conference abstracts
 - *(Optional)* [xAI API](https://console.x.ai) key for KOL X/Twitter ingestion via Grok
+- *(Optional)* NCBI/OpenAlex/openFDA keys for higher rate limits and polite API pools
 
 ### 2. Clone and install
 
@@ -98,8 +110,12 @@ cp .env.template .env
 |-----|-----------------|
 | `OPENAI_API_KEY` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | `AIMLAPI_KEY` | [aimlapi.com](https://aimlapi.com) → API Keys |
-| `BRIGHTDATA_BROWSER_AUTH` | Bright Data dashboard → Scraping Browser zone → Access Parameters → `username:password` |
+| `NCBI_API_KEY` | NCBI account *(optional — raises PubMed rate limits)* |
+| `USER_EMAIL` | Your email *(optional — NCBI/OpenAlex polite pool)* |
+| `OPENALEX_API_KEY` | [openalex.org](https://openalex.org) *(optional — citations)* |
+| `FDA_API_KEY` | [open.fda.gov](https://open.fda.gov/apis/authentication/) *(optional — raises openFDA limits)* |
 | `XAI_API_KEY` | [console.x.ai](https://console.x.ai) → API Keys *(optional — enables KOL X ingestion)* |
+| `BRIGHTDATA_BROWSER_AUTH` | Bright Data dashboard → Scraping Browser zone → Access Parameters → `username:password` *(optional)* |
 
 ### 4. Validate connections
 
@@ -107,13 +123,13 @@ cp .env.template .env
 python test_connections.py
 ```
 
-All four required checks must show `✓ PASS` before proceeding:
+Required checks must show `✓ PASS` before proceeding. Optional sources may warn if their keys are not configured:
 
 ```
 ✓ PASS  aimlapi (required)
-✓ PASS  brightdata (required)
 ✓ PASS  reddit scrape (required)
 ✓ PASS  preprints (required)
+⚠ WARN  brightdata (optional)
 ⚠ WARN  twitter (optional)
 ```
 
@@ -142,7 +158,7 @@ PathwayPulse is ready to deploy on **[Streamlit Community Cloud](https://share.s
 
 Full instructions: **[DEPLOY.md](DEPLOY.md)**
 
-**What judges get without BrightData:** preprints, Reddit, Catalyst Calendar (API v2), AI synthesis, node graph, and intelligence report (~2–4 min per run).
+**What judges get without BrightData:** preprints, PubMed, Reddit, ClinicalTrials.gov API v2, Catalyst Calendar, validation/enrichment layers, AI synthesis, node graph, and intelligence report (~2–4 min per run).
 
 **With BrightData secret:** ACR conference abstracts also enabled (~4–5 min per run).
 
@@ -150,7 +166,7 @@ Full instructions: **[DEPLOY.md](DEPLOY.md)**
 
 ## How BrightData Is Used
 
-BrightData's **Scraping Browser** (Playwright over CDP WebSocket) is used for two targets that require JavaScript rendering and bot-evasion:
+BrightData's **Scraping Browser** (Playwright over CDP WebSocket) is optional and used only for conference abstract portals that benefit from JavaScript rendering and bot-evasion:
 
 ### 1. ACR Conference Abstracts (`acrabstracts.org`)
 
@@ -164,25 +180,19 @@ The American College of Rheumatology abstract portal returns server-rendered HTM
 
 **Access tier:** Green — `acrabstracts.org/robots.txt` is fully open (`Disallow:` nothing).
 
-### 2. ClinicalTrials.gov Text Records (`clinicaltrials.gov`)
-
-The ClinicalTrials.gov search interface is a JavaScript-heavy Angular SPA. BrightData renders it and extracts NCT IDs from the result cards.
-
-**Note:** BrightData classifies `.gov` domains as Government and blocks them by default. The scraper detects this and falls back automatically to the free ClinicalTrials.gov **API v2** (`clinicaltrials.gov/api/v2/studies`), which requires no authentication and returns the same structured data.
-
-### Catalyst Calendar — Hybrid BrightData + API v2
+### ClinicalTrials.gov and Catalyst Calendar — API v2
 
 ```
-BrightData Scraping Browser
-  └─► NCT IDs from search result cards
-        └─► CT API v2 enrichment per NCT ID
+ClinicalTrials.gov API v2
+  └─► query.term / query.intr / query.spons
+        └─► NCT IDs + structured study modules
               └─► startDateStruct, primaryCompletionDateStruct,
                   status, phase, sponsor, interventions
                     └─► derive days_until_readout, bucket
                           (overdue / imminent / near / upcoming / reported)
 ```
 
-If BrightData is unavailable or blocked, the pipeline falls back to a direct API v2 keyword query, ensuring the Catalyst Calendar always populates.
+ClinicalTrials.gov no longer uses BrightData or Playwright. The app queries the free API v2 directly and returns `[]` gracefully if the endpoint is unavailable.
 
 ### Connection pattern
 
@@ -205,6 +215,8 @@ async with async_playwright() as p:
 |--------|--------------|---------------|-------|
 | bioRxiv | REST API (`api.biorxiv.org`) | None | Paginated JSON; up to 300 records per run |
 | medRxiv | REST API (`api.biorxiv.org`) | None | Same endpoint, `server=medrxiv` |
+| PubMed | NCBI E-utilities | Optional `NCBI_API_KEY` | Peer-reviewed abstracts for signal maturity |
+| OpenAlex | REST API (`api.openalex.org`) | Optional `OPENALEX_API_KEY` | Citation counts and journal-version metadata for DOI-bearing preprints |
 | Reddit | Atom RSS feed | None | `reddit.com/r/{sub}/new.rss` — OAuth not required |
 | X / Twitter | Grok `x_search` tool (xAI API) | `XAI_API_KEY` | ~$0.005/run; enter handles in sidebar |
 | ChemRxiv | REST API (`chemrxiv.org`) | None | Pharmacology/biochemistry filter |
@@ -213,11 +225,22 @@ async with async_playwright() as p:
 | ACR Abstracts (`acrabstracts.org`) | BrightData Scraping Browser | `BRIGHTDATA_BROWSER_AUTH` | Green tier — open `robots.txt`. Up to 45 abstracts per run |
 | ASCO Abstracts (`meetings.asco.org`) | BrightData Scraping Browser | `BRIGHTDATA_BROWSER_AUTH` | Red tier — ASCO is a non-profit; BrightData may apply NGO classification. Returns `[]` gracefully if blocked. Submit KYC at brightdata.com to unlock |
 
+## Validation & Enrichment Sources
+
+| Source | Access method | Auth required | Used for |
+|--------|--------------|---------------|----------|
+| OpenTargets | GraphQL API | None | Target-disease association scores for detected gene/indication pairs |
+| Reactome | AnalysisService API | None | Pathway enrichment over resolved target genes |
+| Ensembl | REST API | None | Gene symbol / Ensembl ID resolution and genomic metadata |
+| UniProt | REST API | None | Reviewed human protein names, function notes, locations, GO terms |
+| ChEMBL | REST API | None | Drug mechanism of action, indications, representative IC50/Ki rows |
+| openFDA | REST API | Optional `FDA_API_KEY` | FAERS adverse-event counts, top reactions, FDA label warnings |
+
 > **Reddit:** Reddit's JSON API requires OAuth and Bright Data respects Reddit's `robots.txt`. The Atom RSS feed is explicitly permitted and is the reliable zero-friction path.
 
 > **X/Twitter:** The free Twitter API is write-only. Bright Data's Scraping Browser cannot access X due to `robots.txt` compliance. PathwayPulse uses the Grok xAI Responses API (`x_search` tool) as the only reliable free-access path.
 
-> **ClinicalTrials.gov:** `.gov` domains are blocked by BrightData's Acceptable Use Policy by default. The Catalyst Calendar uses a hybrid strategy: BrightData for NCT ID discovery on the SPA, then CT API v2 for authoritative structured date fields that the Scraping Browser card text doesn't expose.
+> **ClinicalTrials.gov:** The Catalyst Calendar uses API v2 directly for authoritative structured date fields; no BrightData access is required.
 
 > **Conference abstracts:** BrightData may classify non-profit/NGO domains as restricted. ACR (`acrabstracts.org`) is a private entity with an open `robots.txt` — safe target. ASCO (`meetings.asco.org`) is a non-profit and may trigger an NGO block; the scraper catches `proxy_error` and returns `[]` without crashing.
 
@@ -236,9 +259,26 @@ async with async_playwright() as p:
 ### Executioner — GPT-4o via OpenAI
 
 - Called once per run after all events and catalyst data are collected
-- System prompt defines a structured 4-part report: verdict, immunological soundness, ranked signals, catalyst calendar, risk factors, watch list
-- Catalyst data (overdue/imminent readouts) is injected into the user prompt for context
+- System prompt defines a structured report: verdict, immunological soundness, ranked signals, catalyst calendar, risk factors, watch list
+- Biological validation, pharmacology profiles, and catalyst data are injected into the user prompt for context
 - Cost: ~$0.01–0.05 per report
+
+### Biological validation
+
+`validate_events()` runs between the Synthesizer and Executioner:
+
+- Resolves target candidates with OpenTargets and scores target-disease evidence against the novel indication
+- Runs Reactome enrichment over resolved genes
+- Adds Ensembl gene summaries and UniProt protein annotations to each event
+- Returns partial notes instead of raising when an external source cannot resolve a target
+
+### Pharmacology enrichment
+
+`enrich_pharmacology()` builds per-drug profiles from the explicit drug filter, ClinicalTrials interventions, and obvious drug suffixes in event evidence:
+
+- ChEMBL molecule resolution, mechanisms of action, indications, and representative IC50/Ki rows
+- openFDA FAERS totals, serious event counts, top MedDRA reactions, and selected label warnings
+- Profiles are passed to the Executioner so the Risk Factors section can cite factual pharmacology/safety context
 
 ### Catalyst Calendar derivation
 
@@ -270,6 +310,10 @@ Color coding: 🔴 Overdue · 🟠 Imminent (<90d) · 🟡 Near (90–180d) · �
 | **Drug / Intervention** | Optional. Narrows ClinicalTrials searches to a specific drug (e.g. `tocilizumab`). |
 | **Sponsor / Company** | Optional. Filters ClinicalTrials results to a specific lead sponsor (e.g. `Roche`). |
 | **Days of preprint history** | How far back to pull bioRxiv/medRxiv. 3–7 days default; 14 for broad coverage. |
+| **Include PubMed** | Adds recent peer-reviewed abstracts via NCBI E-utilities. |
+| **Enrich preprints with OpenAlex citations** | Adds citation counts and published-journal metadata where available. |
+| **Run biological validation** | Adds OpenTargets, Reactome, Ensembl, and UniProt grounding to detected events. |
+| **Run pharmacology enrichment** | Adds ChEMBL and openFDA drug context for detected drugs/interventions. |
 | **Include ChemRxiv** | Adds preclinical pharmacology papers. |
 | **Include ClinicalTrials.gov text records** | Scrapes active/recruiting trial summaries; feeds the Synthesizer. |
 | **Show Catalyst Calendar** | Upcoming and overdue trial readouts with dates and days-until badges. Works via API v2 without BrightData. |
@@ -288,6 +332,8 @@ Color coding: 🔴 Overdue · 🟠 Imminent (<90d) · 🟡 Near (90–180d) · �
 - **Gray edges** — weak or speculative signals (<50%)
 - **Intelligence Report** — Bear / Bull / Neutral verdict with immunological soundness, ranked signals, Catalyst Calendar summary, risk factors, watch list
 - **📅 Catalyst Calendar** — color-coded trial readout timeline; each row shows date, days-until badge, phase, sponsor, drug names, and CT.gov link
+- **🧬 Biological Validation** — OpenTargets scores, Reactome matches, Ensembl genes, and UniProt proteins for resolved targets
+- **💊 Pharmacology & Safety** — ChEMBL mechanisms/activity plus openFDA event and label context
 - **📋 Raw Signal Data** — every detected event with link to source
 - **🗂 Ingested Sources** — all raw records grouped by source type
 
@@ -300,10 +346,12 @@ Typical run on `IL-6 signaling` with ACR abstracts enabled:
 | Stage | Records | Duration |
 |-------|---------|----------|
 | bioRxiv + medRxiv | 60 | ~3s |
+| PubMed | up to 50 | ~1–3s |
 | Reddit (5 subs) | 250 | ~2s |
 | ACR abstracts via BrightData | 45 | ~3 min (3 pages) |
-| ClinicalTrials API v2 fallback | 50 | ~1s |
+| ClinicalTrials API v2 | 50 | ~1s |
 | DeepSeek-V3 synthesis (355 records) | 355 | ~90s |
+| Validation / pharmacology enrichment | detected signals / drugs | ~10–45s |
 | GPT-4o Intelligence Report | — | ~15s |
 | **Total (cold)** | **355** | **~4–5 min** |
 | **Total (warm cache)** | **355** | **~2 min** |
@@ -334,7 +382,7 @@ python swarm_ingestion.py
 | `openai` | SDK for OpenAI (GPT-4o) and AI/ML API (DeepSeek-V3) via `base_url` |
 | `pydantic` | Structured output schema enforcement |
 | `playwright` | Headless browser automation over BrightData CDP WebSocket |
-| `requests` | HTTP calls to preprint APIs and Reddit RSS |
+| `requests` | HTTP calls to ingestion, validation, pharmacology, and annotation APIs |
 | `tenacity` | Exponential backoff retry for API calls |
 | `python-dotenv` | `.env` file loading |
 
@@ -344,14 +392,13 @@ python swarm_ingestion.py
 
 **Expand data sources**
 - SEC EDGAR 8-K/10-K filings — companies bury cross-indication pivots in footnotes months before press releases
-- PubMed/NCBI Entrez — peer-reviewed publications add signal maturity context layered on top of preprints
 - Additional conference portals — EASD (diabetes), ESMO (oncology) as BrightData targets once robots.txt access is confirmed
 
 **Signal tracking over time**
 Store `CrossPollinationEvent` history in SQLite. Add a "Signal Momentum" chart showing confidence score week-over-week — is a thesis strengthening or fading?
 
 **Named entity extraction**
-Add NER over `source_evidence` to auto-populate drug names, company names, trial IDs, and gene targets rather than relying on GPT-4o to infer them.
+Add richer NER over `source_evidence` to auto-populate company names, trial IDs, and ambiguous drug/gene mentions beyond the current suffix and database-resolution heuristics.
 
 **Ticker mapping**
 Map novel indications to publicly traded companies via a curated `indication_to_tickers.json` lookup, turning biological signals directly into equity watch lists.
@@ -372,4 +419,4 @@ MIT
 
 ## Acknowledgments
 
-Built with [Bright Data](https://brightdata.com), [AI/ML API](https://aimlapi.com), [OpenAI](https://openai.com), [xAI Grok](https://x.ai), [bioRxiv](https://biorxiv.org), [medRxiv](https://medrxiv.org), and [Streamlit](https://streamlit.io).
+Built with [Bright Data](https://brightdata.com), [AI/ML API](https://aimlapi.com), [OpenAI](https://openai.com), [xAI Grok](https://x.ai), [bioRxiv](https://biorxiv.org), [medRxiv](https://medrxiv.org), [PubMed](https://pubmed.ncbi.nlm.nih.gov), [OpenAlex](https://openalex.org), [OpenTargets](https://platform.opentargets.org), [Reactome](https://reactome.org), [Ensembl](https://www.ensembl.org), [UniProt](https://www.uniprot.org), [ChEMBL](https://www.ebi.ac.uk/chembl), [openFDA](https://open.fda.gov), and [Streamlit](https://streamlit.io).

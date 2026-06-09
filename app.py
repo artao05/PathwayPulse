@@ -15,7 +15,7 @@ from streamlit_flow.elements import StreamlitFlowEdge, StreamlitFlowNode
 from streamlit_flow.layouts import TreeLayout
 from streamlit_flow.state import StreamlitFlowState
 
-from ai_orchestrator import CrossPollinationEvent, run_pipeline
+from ai_orchestrator import CrossPollinationEvent, DrugPharmacologyProfile, run_pipeline
 from swarm_ingestion import fetch_conference_abstracts, fetch_trial_catalysts, ingest_all
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -104,6 +104,39 @@ def cached_catalysts(
     return fetch_trial_catalysts(pathway=pathway, drug=drug, sponsor=sponsor)
 
 
+def _rank_records_for_analysis(records: list[dict], pathway: str, max_records: int) -> list[dict]:
+    """Keep demo runs quick while preserving the most relevant source mix."""
+    if max_records <= 0 or len(records) <= max_records:
+        return records
+
+    terms = [
+        term.lower()
+        for term in pathway.replace("-", " ").split()
+        if len(term.strip()) >= 3
+    ]
+    source_bonus = {
+        "clinicaltrials": 8,
+        "pubmed": 7,
+        "acr": 6,
+        "asco": 6,
+        "medrxiv": 5,
+        "biorxiv": 5,
+        "chemrxiv": 4,
+        "twitter": 3,
+        "reddit": 1,
+    }
+
+    def score(record: dict) -> tuple[int, int]:
+        text = " ".join(
+            str(record.get(key, ""))
+            for key in ("title", "abstract", "body", "text", "conditions")
+        ).lower()
+        term_hits = sum(1 for term in terms if term in text)
+        return (term_hits * 10 + source_bonus.get(record.get("source", ""), 0), len(text))
+
+    return sorted(records, key=score, reverse=True)[:max_records]
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_pipeline(
     pathway: str,
@@ -119,17 +152,33 @@ def cached_pipeline(
     kol_handles: tuple,
     reddit_subs: tuple,
     model: str,
-) -> tuple[list[dict], str]:
+    include_validation: bool,
+    include_pharmacology: bool,
+    max_analysis_records: int,
+) -> tuple[list[dict], str, list[dict]]:
     records = cached_ingest(
         pathway, days_back, include_pubmed, include_openalex,
         include_chemrxiv, include_clinicaltrials,
         drug, sponsor, conference_list, kol_handles, reddit_subs,
     )
+    records = _rank_records_for_analysis(records, pathway, max_analysis_records)
     cats = cached_catalysts(pathway, drug, sponsor, include_catalysts)
-    events, report = asyncio.run(
-        run_pipeline(records, pathway, executioner_model=model, catalysts=cats or None)
+    events, report, pharmacology_profiles = asyncio.run(
+        run_pipeline(
+            records,
+            pathway,
+            executioner_model=model,
+            catalysts=cats or None,
+            include_validation=include_validation,
+            drug=drug,
+            include_pharmacology=include_pharmacology,
+        )
     )
-    return [e.model_dump() for e in events], report
+    return (
+        [e.model_dump() for e in events],
+        report,
+        [p.model_dump() for p in pharmacology_profiles],
+    )
 
 
 # ── Node graph builder ────────────────────────────────────────────────────────
@@ -275,6 +324,20 @@ with st.sidebar:
             )
 
     days_back = st.slider("Days of source history", min_value=1, max_value=14, value=3)
+    run_depth = st.selectbox(
+        "Run depth",
+        options=["Demo (fast)", "Standard", "Full"],
+        index=0,
+        help=(
+            "Demo mode analyzes the most relevant 80 records. Standard analyzes "
+            "180. Full analyzes everything ingested and can take several minutes."
+        ),
+    )
+    _max_analysis_records = {
+        "Demo (fast)": 80,
+        "Standard": 180,
+        "Full": 0,
+    }[run_depth]
     include_pubmed = st.checkbox(
         "Include PubMed (peer-reviewed)",
         value=True,
@@ -289,6 +352,22 @@ with st.sidebar:
         help=(
             "Adds citation counts and journal-location metadata to DOI-bearing "
             "bioRxiv / medRxiv / ChemRxiv records. OPENALEX_API_KEY is optional."
+        ),
+    )
+    include_validation = st.checkbox(
+        "Run biological validation",
+        value=True,
+        help=(
+            "Uses OpenTargets and Reactome to resolve target/disease context "
+            "and add grounding scores before report generation."
+        ),
+    )
+    include_pharmacology = st.checkbox(
+        "Run pharmacology enrichment",
+        value=True,
+        help=(
+            "Uses ChEMBL and openFDA to add mechanism, IC50/Ki, label, "
+            "and adverse-event context for detected drugs."
         ),
     )
     include_chemrxiv = st.checkbox("Include ChemRxiv (preclinical)", value=False)
@@ -321,11 +400,11 @@ with st.sidebar:
         _conf_selected = st.multiselect(
             "Conference abstracts (BrightData)",
             options=list(_conf_options.keys()),
-            default=["acr"],
+            default=[],
             format_func=lambda k: _conf_options[k],
             help=(
-                "Scrape meeting abstracts — the earliest public disclosure of "
-                "clinical trial data, months before bioRxiv. "
+                "Optional slow source. Scrape meeting abstracts — the earliest "
+                "public disclosure of clinical trial data, months before bioRxiv. "
                 "ACR is green-tier (open robots.txt). "
                 "ASCO carries NGO-classification risk and returns [] if blocked "
                 "(requires BrightData KYC to unlock)."
@@ -461,6 +540,12 @@ if run_btn and pathway_input.strip():
                 ingest_label += ", PubMed"
             if include_openalex:
                 ingest_label += ", OpenAlex citations"
+            if include_validation:
+                ingest_label += ", OpenTargets/Reactome validation"
+            if include_pharmacology:
+                ingest_label += ", ChEMBL/openFDA pharmacology"
+            if _max_analysis_records:
+                ingest_label += f", {run_depth.lower()} cap ({_max_analysis_records} records)"
             if include_clinicaltrials:
                 ingest_label += ", ClinicalTrials.gov (API v2)"
             if conference_list:
@@ -471,20 +556,29 @@ if run_btn and pathway_input.strip():
             ingest_label += "..."
             progress.progress(20, text=ingest_label)
 
-            event_dicts, report = cached_pipeline(
+            event_dicts, report, profile_dicts = cached_pipeline(
                 pathway, days_back, include_pubmed, include_openalex,
                 include_chemrxiv, include_clinicaltrials,
                 drug, sponsor, include_catalysts, conference_list, kol_handles,
-                reddit_subs, model_choice,
+                reddit_subs, model_choice, include_validation, include_pharmacology,
+                _max_analysis_records,
             )
             progress.progress(70, text="Building Arbitrage Matrix...")
 
             events = [CrossPollinationEvent(**d) for d in event_dicts]
+            pharmacology_profiles = [
+                DrugPharmacologyProfile(**d) for d in profile_dicts
+            ]
 
             _records = cached_ingest(
                 pathway, days_back, include_pubmed, include_openalex,
                 include_chemrxiv, include_clinicaltrials,
                 drug, sponsor, conference_list, kol_handles, reddit_subs,
+            )
+            _analyzed_records = _rank_records_for_analysis(
+                _records,
+                pathway,
+                _max_analysis_records,
             )
             _catalysts = cached_catalysts(pathway, drug, sponsor, include_catalysts)
 
@@ -494,8 +588,10 @@ if run_btn and pathway_input.strip():
                 "events": events,
                 "report": report,
                 "record_count": len(_records),
+                "analysis_record_count": len(_analyzed_records),
                 "records": _records,
                 "catalysts": _catalysts,
+                "pharmacology_profiles": pharmacology_profiles,
                 "drug": drug,
                 "sponsor": sponsor,
             }
@@ -515,30 +611,38 @@ if "pipeline_results" in st.session_state:
     events: list[CrossPollinationEvent] = results["events"]
     report: str = results["report"]
     record_count: int = results["record_count"]
+    analysis_record_count: int = results.get("analysis_record_count", record_count)
     raw_records: list[dict] = results.get("records", [])
     catalysts: list[dict] = results.get("catalysts", [])
+    pharmacology_profiles: list[DrugPharmacologyProfile] = [
+        p if isinstance(p, DrugPharmacologyProfile) else DrugPharmacologyProfile(**p)
+        for p in results.get("pharmacology_profiles", [])
+    ]
 
-    # Metrics row — expand to 5 cols when catalysts are present
-    if catalysts:
-        col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-    else:
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    metric_cols = st.columns(8 if catalysts else 7)
 
-    with col_m1:
+    with metric_cols[0]:
         st.metric("Records Ingested", record_count)
-    with col_m2:
+    with metric_cols[1]:
+        st.metric("Records Analyzed", analysis_record_count)
+    with metric_cols[2]:
         st.metric("Signals Detected", len(events))
-    with col_m3:
+    with metric_cols[3]:
         high_conf = sum(1 for e in events if e.confidence_score >= 0.5)
         st.metric("High-Confidence", high_conf)
-    with col_m4:
+    with metric_cols[4]:
         avg_conf = (
             f"{sum(e.confidence_score for e in events) / len(events):.0%}"
             if events else "—"
         )
         st.metric("Avg Confidence", avg_conf)
+    validation_supported = sum(
+        1 for e in events
+        if e.opentargets_association_score is not None
+        and e.opentargets_association_score > 0
+    )
     if catalysts:
-        with col_m5:
+        with metric_cols[5]:
             actionable = [c for c in catalysts if c["bucket"] in ("overdue", "imminent")]
             near_cat = next(
                 (c for c in catalysts if c["days_until_readout"] is not None
@@ -551,6 +655,15 @@ if "pipeline_results" in st.session_state:
                           delta_color="inverse")
             else:
                 st.metric("Trials Tracked", len(catalysts))
+        with metric_cols[6]:
+            st.metric("OT Supported", validation_supported)
+        with metric_cols[7]:
+            st.metric("Drug Profiles", len(pharmacology_profiles))
+    else:
+        with metric_cols[5]:
+            st.metric("OT Supported", validation_supported)
+        with metric_cols[6]:
+            st.metric("Drug Profiles", len(pharmacology_profiles))
 
     st.markdown("---")
 
@@ -613,9 +726,146 @@ if "pipeline_results" in st.session_state:
                         )
                     else:
                         st.markdown(f"- Published version: {ev.published_version_source}")
+                if ev.validation_status != "not_run":
+                    st.markdown(f"- Validation status: `{ev.validation_status}`")
+                if ev.opentargets_association_score is not None:
+                    score = ev.opentargets_association_score
+                    target_label = ev.opentargets_target_symbol or ev.opentargets_target_id
+                    disease_label = ev.opentargets_disease_name or ev.opentargets_disease_id
+                    st.markdown(
+                        f"- OpenTargets: `{target_label}` ↔ `{disease_label}` "
+                        f"score `{score:.3f}`"
+                    )
+                if ev.reactome_pathway_match:
+                    fdr_label = (
+                        f" (FDR {ev.reactome_pathway_fdr:.2g})"
+                        if ev.reactome_pathway_fdr is not None else ""
+                    )
+                    st.markdown(f"- Reactome: {ev.reactome_pathway_match}{fdr_label}")
+                if ev.ensembl_gene_annotations:
+                    gene_labels = ", ".join(
+                        f"{row.get('symbol') or row.get('query')} ({row.get('ensembl_gene_id')})"
+                        for row in ev.ensembl_gene_annotations[:3]
+                        if row.get("ensembl_gene_id")
+                    )
+                    if gene_labels:
+                        st.markdown(f"- Ensembl: {gene_labels}")
+                if ev.uniprot_annotations:
+                    protein_labels = ", ".join(
+                        f"{row.get('protein_name') or row.get('entry_name')} ({row.get('accession')})"
+                        for row in ev.uniprot_annotations[:2]
+                        if row.get("accession")
+                    )
+                    if protein_labels:
+                        st.markdown(f"- UniProt: {protein_labels}")
+                if ev.validation_notes:
+                    st.markdown(f"- Validation notes: {'; '.join(ev.validation_notes[:2])}")
                 st.markdown(f"- Evidence: _{ev.source_evidence[:250]}_")
                 if i < len(events) - 1:
                     st.markdown("---")
+
+    if events and any(ev.validation_status != "not_run" for ev in events):
+        with st.expander("🧬 Biological Validation", expanded=False):
+            for ev in sorted(events, key=lambda e: e.confidence_score, reverse=True)[:12]:
+                target_label = ev.opentargets_target_symbol or ev.opentargets_target_id or "unresolved target"
+                disease_label = ev.opentargets_disease_name or ev.novel_indication
+                score_label = (
+                    f"{ev.opentargets_association_score:.3f}"
+                    if ev.opentargets_association_score is not None else "unresolved"
+                )
+                st.markdown(f"**{ev.novel_indication}**")
+                st.caption(
+                    f"OpenTargets: {target_label} -> {disease_label} | score {score_label}"
+                )
+                if ev.reactome_pathway_match:
+                    fdr_label = (
+                        f" | FDR {ev.reactome_pathway_fdr:.2g}"
+                        if ev.reactome_pathway_fdr is not None else ""
+                    )
+                    st.caption(f"Reactome: {ev.reactome_pathway_match}{fdr_label}")
+                if ev.opentargets_top_disease_targets:
+                    top_targets = ", ".join(
+                        f"{row.get('target_symbol', '')} ({row.get('score', 0):.2f})"
+                        for row in ev.opentargets_top_disease_targets[:3]
+                        if row.get("target_symbol")
+                    )
+                    if top_targets:
+                        st.caption(f"Top disease targets: {top_targets}")
+                if ev.ensembl_gene_annotations:
+                    gene_labels = ", ".join(
+                        f"{row.get('symbol') or row.get('query')} {row.get('ensembl_gene_id')}"
+                        for row in ev.ensembl_gene_annotations[:3]
+                        if row.get("ensembl_gene_id")
+                    )
+                    if gene_labels:
+                        st.caption(f"Ensembl: {gene_labels}")
+                if ev.uniprot_annotations:
+                    protein_labels = ", ".join(
+                        f"{row.get('accession')} {row.get('protein_name') or row.get('entry_name')}"
+                        for row in ev.uniprot_annotations[:2]
+                        if row.get("accession")
+                    )
+                    if protein_labels:
+                        st.caption(f"UniProt: {protein_labels}")
+
+    if pharmacology_profiles:
+        with st.expander(f"💊 Pharmacology & Safety ({len(pharmacology_profiles)} drugs)", expanded=False):
+            for profile in pharmacology_profiles:
+                st.markdown(f"**{profile.drug_name}**")
+                meta_parts = []
+                if profile.chembl_pref_name:
+                    meta_parts.append(profile.chembl_pref_name)
+                if profile.chembl_molecule_id:
+                    meta_parts.append(profile.chembl_molecule_id)
+                if profile.molecule_type:
+                    meta_parts.append(profile.molecule_type)
+                if profile.max_phase is not None:
+                    meta_parts.append(f"max phase {profile.max_phase:g}")
+                if profile.first_approval:
+                    meta_parts.append(f"first approval {profile.first_approval}")
+                if profile.black_box_warning is not None:
+                    meta_parts.append(
+                        "boxed warning flagged" if profile.black_box_warning else "no boxed warning flag"
+                    )
+                if meta_parts:
+                    st.caption(" · ".join(meta_parts))
+                if profile.mechanisms:
+                    st.markdown("Mechanism")
+                    for mech in profile.mechanisms[:3]:
+                        action = mech.get("action_type") or "MOA"
+                        moa = mech.get("mechanism_of_action") or "mechanism not specified"
+                        target = mech.get("target_name") or mech.get("target_chembl_id") or "target not specified"
+                        st.caption(f"{action}: {moa} ({target})")
+                if profile.bioactivities:
+                    st.markdown("Representative IC50/Ki")
+                    for act in profile.bioactivities[:4]:
+                        value = act.get("standard_value")
+                        units = act.get("standard_units") or ""
+                        nm = act.get("normalized_value_nM")
+                        nm_label = f", {nm:.2g} nM" if nm is not None else ""
+                        target = act.get("target_pref_name") or act.get("target_chembl_id") or "target not specified"
+                        st.caption(
+                            f"{act.get('standard_type', '')} {act.get('standard_relation', '')} "
+                            f"{value} {units}{nm_label} at {target}".strip()
+                        )
+                if profile.openfda_total_events is not None:
+                    serious = (
+                        f"; {profile.openfda_serious_events:,} serious"
+                        if profile.openfda_serious_events is not None else ""
+                    )
+                    st.caption(f"openFDA FAERS: {profile.openfda_total_events:,} reports{serious}")
+                if profile.openfda_top_reactions:
+                    reactions = ", ".join(
+                        f"{row.get('reaction')} ({row.get('count')})"
+                        for row in profile.openfda_top_reactions[:5]
+                        if row.get("reaction")
+                    )
+                    if reactions:
+                        st.caption(f"Top reactions: {reactions}")
+                for warning in profile.openfda_label_warnings[:2]:
+                    st.caption(f"Label warning: {warning}")
+                if profile.notes:
+                    st.caption("Notes: " + "; ".join(profile.notes[:2]))
 
     # ── Catalyst Calendar ──────────────────────────────────────────────────────
     if catalysts:
